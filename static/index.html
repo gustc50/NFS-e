@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFS-e Monitor — Portal Nacional</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧾</text></svg>">
+</head>
+<body>
+<header class="topo">
+  <div class="topo-titulo">
+    <span class="logo">🧾</span>
+    <div>
+      <h1>NFS-e Monitor</h1>
+      <p>Sistema Nacional NFS-e — Ambiente de Dados Nacional</p>
+    </div>
+  </div>
+</header>
+
+<nav class="abas" id="abas"></nav>
+
+<main id="conteudo">
+  <div class="vazio" id="tela-vazia">
+    <div class="vazio-card">
+      <span class="vazio-icone">🏢</span>
+      <h2>Nenhuma empresa cadastrada</h2>
+      <p>Cadastre a primeira empresa com o certificado digital A1 (.pfx/.p12)
+         para começar a consultar as notas emitidas e recebidas no Portal Nacional.</p>
+      <button class="btn btn-primario" onclick="abrirModalEmpresa()">＋ Cadastrar empresa</button>
+    </div>
+  </div>
+
+  <section id="painel" class="painel oculto">
+    <div class="painel-cabecalho">
+      <div class="empresa-info">
+        <h2 id="empresa-nome"></h2>
+        <div class="empresa-meta">
+          <span id="empresa-cnpj" class="meta-item"></span>
+          <span id="empresa-ambiente" class="badge"></span>
+          <span id="empresa-cert" class="badge"></span>
+        </div>
+      </div>
+      <div class="painel-acoes">
+        <button class="btn" onclick="testarConexao()" title="Testa a conexão mTLS com o ADN">🔌 Testar conexão</button>
+        <button class="btn" onclick="abrirModalEditar()" title="Editar empresa / trocar certificado">✏️ Editar</button>
+        <button class="btn btn-perigo" onclick="abrirModalExcluir()" title="Excluir empresa e suas notas">🗑</button>
+      </div>
+    </div>
+
+    <div class="filtros">
+      <div class="filtro-datas">
+        <label>Período inicial
+          <input type="date" id="data-inicio">
+        </label>
+        <label>Período final
+          <input type="date" id="data-fim">
+        </label>
+        <div class="atalhos">
+          <button class="chip" onclick="atalhoPeriodo('mes')">Este mês</button>
+          <button class="chip" onclick="atalhoPeriodo('mes-passado')">Mês passado</button>
+          <button class="chip" onclick="atalhoPeriodo('30d')">Últimos 30 dias</button>
+          <button class="chip" onclick="atalhoPeriodo('ano')">Este ano</button>
+        </div>
+      </div>
+      <div class="filtro-acoes">
+        <a class="btn" id="btn-csv" href="#" title="Exportar o período para CSV (Excel)">⬇ CSV</a>
+        <button class="btn btn-primario" id="btn-sync" onclick="sincronizar()">🔄 Sincronizar</button>
+      </div>
+    </div>
+
+    <div id="sync-status" class="sync-status oculto"></div>
+
+    <div class="colunas">
+      <div class="coluna">
+        <div class="coluna-titulo emitidas">
+          <h3>📤 Emitidas no período</h3>
+          <div class="coluna-totais" id="totais-emitidas"></div>
+        </div>
+        <div class="tabela-wrap">
+          <table>
+            <thead>
+              <tr><th>Nº</th><th>Emissão</th><th>Tomador</th><th class="th-num">Valor</th><th></th></tr>
+            </thead>
+            <tbody id="lista-emitidas"></tbody>
+          </table>
+          <div class="lista-vazia oculto" id="vazio-emitidas">Nenhuma nota emitida no período.</div>
+        </div>
+      </div>
+
+      <div class="coluna">
+        <div class="coluna-titulo recebidas">
+          <h3>📥 Recebidas no período</h3>
+          <div class="coluna-totais" id="totais-recebidas"></div>
+        </div>
+        <div class="tabela-wrap">
+          <table>
+            <thead>
+              <tr><th>Nº</th><th>Emissão</th><th>Prestador</th><th class="th-num">Valor</th><th></th></tr>
+            </thead>
+            <tbody id="lista-recebidas"></tbody>
+          </table>
+          <div class="lista-vazia oculto" id="vazio-recebidas">Nenhuma nota recebida no período.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Modal cadastro / edição de empresa -->
+<div class="modal-fundo oculto" id="modal-empresa">
+  <div class="modal">
+    <h2 id="modal-empresa-titulo">Cadastrar empresa</h2>
+    <form id="form-empresa" onsubmit="return salvarEmpresa(event)">
+      <label>Nome de exibição <small>(opcional — usa a razão social do certificado)</small>
+        <input type="text" name="nome" maxlength="120" placeholder="Ex.: Minha Empresa LTDA">
+      </label>
+      <label id="campo-cert">Certificado digital A1 (.pfx / .p12)
+        <input type="file" name="certificado" accept=".pfx,.p12">
+      </label>
+      <label>Senha do certificado
+        <input type="password" name="senha" autocomplete="off" placeholder="••••••••">
+      </label>
+      <label>Ambiente
+        <select name="ambiente">
+          <option value="producao">Produção (notas reais)</option>
+          <option value="producao_restrita">Produção Restrita (testes)</option>
+        </select>
+      </label>
+      <div class="modal-erro oculto" id="modal-empresa-erro"></div>
+      <div class="modal-acoes">
+        <button type="button" class="btn" onclick="fecharModais()">Cancelar</button>
+        <button type="submit" class="btn btn-primario" id="btn-salvar-empresa">Salvar</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Modal exclusão -->
+<div class="modal-fundo oculto" id="modal-excluir">
+  <div class="modal">
+    <h2>Excluir empresa</h2>
+    <p id="texto-excluir"></p>
+    <p class="aviso">O certificado e todas as notas sincronizadas desta empresa serão removidos deste computador. As notas continuam disponíveis no Portal Nacional.</p>
+    <div class="modal-acoes">
+      <button class="btn" onclick="fecharModais()">Cancelar</button>
+      <button class="btn btn-perigo" onclick="excluirEmpresa()">Excluir</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal detalhe da nota -->
+<div class="modal-fundo oculto" id="modal-nota">
+  <div class="modal modal-larga">
+    <h2 id="nota-titulo">Detalhes da nota</h2>
+    <div id="nota-corpo"></div>
+    <div class="modal-acoes">
+      <button class="btn" onclick="fecharModais()">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast oculto"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

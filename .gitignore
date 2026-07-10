@@ -1,0 +1,12 @@
+# Dados locais — NUNCA versionar (certificados, senhas, banco de notas)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sistema
+.DS_Store
+Thumbs.db
