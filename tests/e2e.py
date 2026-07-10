@@ -129,6 +129,41 @@ def main() -> int:
         assert status == 200 and "Chave de Acesso" in csv_.decode("utf-8-sig")[:200]
         print("✔ downloads XML / DANFSe / CSV")
 
+        # download em lote (ZIP)
+        import io as _io
+        import urllib.request as _ur
+        import zipfile as _zip
+
+        def zip_lote(corpo):
+            pedido = _ur.Request(
+                f"{base}/api/empresas/{eid}/notas/download",
+                data=json.dumps(corpo).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with _ur.urlopen(pedido, timeout=60) as resp:
+                assert resp.headers["Content-Type"] == "application/zip"
+                return _zip.ZipFile(_io.BytesIO(resp.read()))
+
+        # selecionadas: 1 emitida + 1 recebida, somente XML
+        escolhidas = [jul["emitidas"][0]["chave_acesso"], jul["recebidas"][0]["chave_acesso"]]
+        zf = zip_lote({"chaves": escolhidas, "formato": "xml"})
+        nomes = zf.namelist()
+        assert len(nomes) == 2, nomes
+        assert any(n.startswith("Emitidas/") for n in nomes), nomes
+        assert any(n.startswith("Recebidas/") for n in nomes), nomes
+        assert zf.read(nomes[0]).lstrip().startswith(b"<?xml")
+        print("✔ ZIP das notas selecionadas (XML)")
+
+        # todas do período, XML + DANFSe
+        zf = zip_lote({"inicio": "2026-07-01", "fim": "2026-07-31", "formato": "xml_pdf"})
+        nomes = zf.namelist()
+        xmls = [n for n in nomes if n.endswith(".xml")]
+        pdfs = [n for n in nomes if n.endswith(".pdf")]
+        assert len(xmls) == 5 and len(pdfs) == 5, nomes  # 3 emitidas + 2 recebidas
+        assert zf.read(pdfs[0])[:4] == b"%PDF"
+        print("✔ ZIP de todas do período (XML + DANFSe)")
+
         # idempotência
         req("POST", f"{base}/api/empresas/{eid}/sincronizar")
         for _ in range(60):

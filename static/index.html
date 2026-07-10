@@ -65,6 +65,20 @@
       </div>
       <div class="filtro-acoes">
         <a class="btn" id="btn-csv" href="#" title="Exportar o período para CSV (Excel)">⬇ CSV</a>
+        <details class="dropdown" id="dd-selecionadas">
+          <summary class="btn" title="Baixa as notas marcadas nas caixas de seleção">⬇ Selecionadas (<span id="qtd-selecionadas">0</span>) ▾</summary>
+          <div class="menu">
+            <button onclick="baixarLote('selecionadas','xml')">Somente XML (rápido)</button>
+            <button onclick="baixarLote('selecionadas','xml_pdf')">XML + DANFSe (PDF)</button>
+          </div>
+        </details>
+        <details class="dropdown" id="dd-todas">
+          <summary class="btn" title="Baixa todas as notas do período filtrado">⬇ Todas do período ▾</summary>
+          <div class="menu">
+            <button onclick="baixarLote('todas','xml')">Somente XML (rápido)</button>
+            <button onclick="baixarLote('todas','xml_pdf')">XML + DANFSe (PDF)</button>
+          </div>
+        </details>
         <button class="btn btn-primario" id="btn-sync" onclick="sincronizar()">🔄 Sincronizar</button>
       </div>
     </div>
@@ -80,7 +94,8 @@
         <div class="tabela-wrap">
           <table>
             <thead>
-              <tr><th>Nº</th><th>Emissão</th><th>Tomador</th><th class="th-num">Valor</th><th></th></tr>
+              <tr><th class="th-sel"><input type="checkbox" id="sel-todas-emitidas" title="Selecionar todas" onchange="selecionarColuna('emitidas', this.checked)"></th>
+                  <th>Nº</th><th>Emissão</th><th>Tomador</th><th class="th-num">Valor</th><th></th></tr>
             </thead>
             <tbody id="lista-emitidas"></tbody>
           </table>
@@ -96,7 +111,8 @@
         <div class="tabela-wrap">
           <table>
             <thead>
-              <tr><th>Nº</th><th>Emissão</th><th>Prestador</th><th class="th-num">Valor</th><th></th></tr>
+              <tr><th class="th-sel"><input type="checkbox" id="sel-todas-recebidas" title="Selecionar todas" onchange="selecionarColuna('recebidas', this.checked)"></th>
+                  <th>Nº</th><th>Emissão</th><th>Prestador</th><th class="th-num">Valor</th><th></th></tr>
             </thead>
             <tbody id="lista-recebidas"></tbody>
           </table>

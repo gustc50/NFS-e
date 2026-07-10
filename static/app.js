@@ -6,6 +6,7 @@ let empresaAtual = null;
 let notasCache = { emitidas: [], recebidas: [] };
 let pollTimer = null;
 let editando = false;
+const selecionadas = new Set(); // chaves de acesso marcadas nas duas colunas
 
 const $ = (id) => document.getElementById(id);
 const fmtBRL = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
@@ -145,8 +146,10 @@ async function carregarNotas() {
   try {
     const dados = await api(`/api/empresas/${emp.id}/notas?inicio=${ini}&fim=${fim}`);
     notasCache = dados;
+    selecionadas.clear();
     renderColuna("emitidas", dados.emitidas, dados.totais.emitidas);
     renderColuna("recebidas", dados.recebidas, dados.totais.recebidas);
+    atualizarSelecao();
   } catch (e) {
     toast(e.message, "erro");
   }
@@ -173,6 +176,8 @@ function renderColuna(qual, notas, totais) {
     if (n.papel === "intermediada") tag += ' <span class="tag-situacao tag-intermediada">INTERMEDIADA</span>';
     if (n.situacao !== "ATIVA") tr.className = "nota-cancelada";
     tr.innerHTML =
+      `<td class="td-sel"><input type="checkbox" class="sel-nota" data-coluna="${qual}" data-chave="${esc(n.chave_acesso)}"` +
+      `${selecionadas.has(n.chave_acesso) ? " checked" : ""} onclick="event.stopPropagation()" onchange="marcarNota(this)"></td>` +
       `<td>${esc(n.numero || "—")}</td>` +
       `<td>${dataBR(n.data_emissao)}</td>` +
       `<td class="td-contraparte"><span class="contraparte-nome">${esc(contraNome)}</span>` +
@@ -219,6 +224,74 @@ async function abrirDetalheNota(n) {
     `<a class="btn" href="/api/empresas/${emp.id}/notas/${n.chave_acesso}/danfse" target="_blank">⬇ DANFSe (PDF)</a>` +
     "</div>";
   $("modal-nota").classList.remove("oculto");
+}
+
+/* ------------------------------------------------ seleção e download em lote */
+
+function marcarNota(caixa) {
+  if (caixa.checked) selecionadas.add(caixa.dataset.chave);
+  else selecionadas.delete(caixa.dataset.chave);
+  atualizarSelecao();
+}
+
+function selecionarColuna(qual, marcado) {
+  document.querySelectorAll(`#lista-${qual} .sel-nota`).forEach((c) => {
+    c.checked = marcado;
+    if (marcado) selecionadas.add(c.dataset.chave);
+    else selecionadas.delete(c.dataset.chave);
+  });
+  atualizarSelecao();
+}
+
+function atualizarSelecao() {
+  $("qtd-selecionadas").textContent = selecionadas.size;
+  $("dd-selecionadas").classList.toggle("desabilitado", selecionadas.size === 0);
+  for (const qual of ["emitidas", "recebidas"]) {
+    const caixas = [...document.querySelectorAll(`#lista-${qual} .sel-nota`)];
+    const geral = $(`sel-todas-${qual}`);
+    geral.checked = caixas.length > 0 && caixas.every((c) => c.checked);
+    geral.indeterminate = caixas.some((c) => c.checked) && !geral.checked;
+  }
+}
+
+async function baixarLote(escopo, formato) {
+  document.querySelectorAll("details.dropdown").forEach((d) => (d.open = false));
+  const emp = empresa();
+  if (!emp) return;
+  const corpo = { formato };
+  if (escopo === "selecionadas") {
+    if (selecionadas.size === 0) return toast("Marque ao menos uma nota nas caixas de seleção.", "erro");
+    corpo.chaves = [...selecionadas];
+  } else {
+    corpo.inicio = $("data-inicio").value;
+    corpo.fim = $("data-fim").value;
+  }
+  toast(formato === "xml_pdf"
+    ? "Preparando ZIP (baixando DANFSes do Portal Nacional, aguarde)..."
+    : "Preparando arquivo ZIP...");
+  try {
+    const resp = await fetch(`/api/empresas/${emp.id}/notas/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(corpo),
+    });
+    if (!resp.ok) {
+      let detalhe = `Erro ${resp.status}`;
+      try { detalhe = (await resp.json()).detail || detalhe; } catch (_) {}
+      throw new Error(detalhe);
+    }
+    const nome = (resp.headers.get("Content-Disposition") || "").match(/filename="?([^";]+)/)?.[1]
+      || "notas.zip";
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = nome;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    toast(`ZIP gerado: ${nome}`, "ok");
+  } catch (e) {
+    toast(e.message, "erro");
+  }
 }
 
 /* ------------------------------------------------ sincronização */
@@ -385,6 +458,11 @@ function fecharModais() {
 }
 
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") fecharModais(); });
+document.addEventListener("click", (e) => {
+  document.querySelectorAll("details.dropdown[open]").forEach((d) => {
+    if (!d.contains(e.target)) d.open = false;
+  });
+});
 document.querySelectorAll(".modal-fundo").forEach((m) =>
   m.addEventListener("click", (e) => { if (e.target === m) fecharModais(); })
 );

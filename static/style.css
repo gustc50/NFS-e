@@ -128,7 +128,28 @@ main { padding: 20px 24px 40px; max-width: 1500px; margin: 0 auto; }
   padding: 5px 12px; font-size: 12px; cursor: pointer; color: var(--texto-suave);
 }
 .chip:hover { background: #eceff5; }
-.filtro-acoes { display: flex; gap: 8px; }
+.filtro-acoes { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* dropdown de download em lote */
+.dropdown { position: relative; }
+.dropdown summary { list-style: none; user-select: none; }
+.dropdown summary::-webkit-details-marker { display: none; }
+.dropdown .menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+  background: #fff; border: 1px solid var(--borda); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(16, 24, 40, .18);
+  min-width: 210px; overflow: hidden;
+}
+.dropdown .menu button {
+  display: block; width: 100%; text-align: left; border: none; background: none;
+  padding: 10px 14px; font-size: 13px; cursor: pointer; color: var(--texto);
+}
+.dropdown .menu button:hover { background: #eef2fa; }
+.dropdown.desabilitado { opacity: .55; pointer-events: none; }
+
+/* seleção de notas */
+.th-sel, .td-sel { width: 30px; text-align: center; }
+.sel-nota, .th-sel input { cursor: pointer; width: 15px; height: 15px; accent-color: var(--azul); }
 
 /* ---------- status da sincronização ---------- */
 .sync-status {

@@ -9,13 +9,16 @@ import csv
 import datetime as dt
 import gzip
 import io
+import re
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import config, db, security
 from .adn_client import AdnClient, AdnErro
@@ -214,11 +217,8 @@ def excluir_empresa(empresa_id: int):
 @app.post("/api/empresas/{empresa_id}/testar")
 def testar_conexao(empresa_id: int):
     empresa = _empresa_ou_404(empresa_id)
-    pfx_bytes = (config.CERT_DIR / empresa["cert_arquivo"]).read_bytes()
-    senha = security.descriptografar(empresa["senha_cripto"])
     try:
-        ctx = criar_ssl_context(pfx_bytes, senha)
-        with AdnClient(empresa["ambiente"], ctx) as cliente:
+        with _criar_cliente(empresa) as cliente:
             mensagem = cliente.testar_conexao(int(empresa["ultimo_nsu"] or 0))
     except (AdnErro, CertificadoInvalido) as exc:
         raise HTTPException(502, str(exc)) from exc
@@ -370,25 +370,108 @@ def baixar_xml(empresa_id: int, chave: str):
     )
 
 
+def _criar_cliente(empresa) -> AdnClient:
+    pfx_bytes = (config.CERT_DIR / empresa["cert_arquivo"]).read_bytes()
+    senha = security.descriptografar(empresa["senha_cripto"])
+    ctx = criar_ssl_context(pfx_bytes, senha)
+    return AdnClient(empresa["ambiente"], ctx)
+
+
+def _obter_danfse_bytes(empresa, chave: str, cliente: AdnClient | None = None) -> bytes:
+    """PDF da nota, com cache local em ``data/danfse``."""
+    cache = config.DANFSE_CACHE_DIR / f"{chave}.pdf"
+    if cache.exists():
+        return cache.read_bytes()
+    if cliente is None:
+        with _criar_cliente(empresa) as novo:
+            pdf = novo.baixar_danfse(chave)
+    else:
+        pdf = cliente.baixar_danfse(chave)
+    cache.write_bytes(pdf)
+    return pdf
+
+
 @app.get("/api/empresas/{empresa_id}/notas/{chave}/danfse")
 def baixar_danfse(empresa_id: int, chave: str):
     empresa = _empresa_ou_404(empresa_id)
     _nota_ou_404(empresa_id, chave)
-    cache = config.DANFSE_CACHE_DIR / f"{chave}.pdf"
-    if not cache.exists():
-        pfx_bytes = (config.CERT_DIR / empresa["cert_arquivo"]).read_bytes()
-        senha = security.descriptografar(empresa["senha_cripto"])
-        try:
-            ctx = criar_ssl_context(pfx_bytes, senha)
-            with AdnClient(empresa["ambiente"], ctx) as cliente:
-                pdf = cliente.baixar_danfse(chave)
-        except (AdnErro, CertificadoInvalido) as exc:
-            raise HTTPException(502, str(exc)) from exc
-        cache.write_bytes(pdf)
-    return FileResponse(
-        cache,
+    try:
+        pdf = _obter_danfse_bytes(empresa, chave)
+    except (AdnErro, CertificadoInvalido) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return Response(
+        content=pdf,
         media_type="application/pdf",
-        filename=f"DANFSe_{chave}.pdf",
+        headers={"Content-Disposition": f'attachment; filename="DANFSe_{chave}.pdf"'},
+    )
+
+
+class DownloadLote(BaseModel):
+    chaves: list[str] | None = None   # notas selecionadas; ausente = usar período
+    inicio: str = ""
+    fim: str = ""
+    formato: str = "xml"              # "xml" | "xml_pdf"
+
+
+_PASTAS_PAPEL = {"emitida": "Emitidas", "recebida": "Recebidas", "intermediada": "Intermediadas"}
+
+
+@app.post("/api/empresas/{empresa_id}/notas/download")
+def baixar_lote(empresa_id: int, pedido: DownloadLote):
+    empresa = _empresa_ou_404(empresa_id)
+    if pedido.formato not in ("xml", "xml_pdf"):
+        raise HTTPException(400, "Formato inválido.")
+
+    if pedido.chaves:
+        chaves = [c for c in pedido.chaves if re.fullmatch(r"[0-9A-Za-z]+", c)]
+        notas = []
+        with db.conexao() as con:
+            for i in range(0, len(chaves), 500):
+                parte = chaves[i:i + 500]
+                marcadores = ",".join("?" * len(parte))
+                notas += con.execute(
+                    f"SELECT * FROM notas WHERE empresa_id = ? AND chave_acesso IN ({marcadores})",
+                    (empresa_id, *parte),
+                ).fetchall()
+        rotulo = f"selecionadas_{len(notas)}"
+    else:
+        notas = _consultar_notas(empresa_id, pedido.inicio, pedido.fim)
+        rotulo = f"{pedido.inicio or 'inicio'}_a_{pedido.fim or 'fim'}"
+    if not notas:
+        raise HTTPException(404, "Nenhuma nota encontrada para baixar.")
+
+    avisos: list[str] = []
+    buffer = io.BytesIO()
+    cliente = None
+    try:
+        if pedido.formato == "xml_pdf":
+            cliente = _criar_cliente(empresa)
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for nota in notas:
+                pasta = _PASTAS_PAPEL.get(nota["papel"], "Outras")
+                nome = f"NFSe_{nota['numero'] or 'sn'}_{nota['chave_acesso']}"
+                zf.writestr(f"{pasta}/{nome}.xml", gzip.decompress(nota["xml_gzip"]))
+                if pedido.formato == "xml_pdf":
+                    try:
+                        pdf = _obter_danfse_bytes(empresa, nota["chave_acesso"], cliente)
+                        zf.writestr(f"{pasta}/{nome}.pdf", pdf)
+                    except (AdnErro, CertificadoInvalido) as exc:
+                        avisos.append(f"Nota {nota['numero']} ({nota['chave_acesso']}): DANFSe indisponível — {exc}")
+            if avisos:
+                zf.writestr(
+                    "AVISOS.txt",
+                    "Os XMLs abaixo foram incluídos, mas o PDF (DANFSe) não pôde ser baixado:\r\n\r\n"
+                    + "\r\n".join(avisos),
+                )
+    finally:
+        if cliente is not None:
+            cliente.fechar()
+
+    nome_zip = f"NFSe_{empresa['cnpj']}_{rotulo}.zip"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{nome_zip}"'},
     )
 
 
