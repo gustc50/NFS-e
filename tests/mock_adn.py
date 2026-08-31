@@ -140,6 +140,12 @@ for i, (dia, mes, valor) in enumerate([
 # Evento: cancelamento da nota emitida seq=3 (18/06)
 add("EVENTO", xml_evento(3, "2026-06-19T11:00:00-03:00"), chave(3))
 
+# Evento: cancelamento por substituição da nota emitida seq=2 (10/06)
+add("EVENTO", xml_evento(
+    2, "2026-06-11T09:00:00-03:00",
+    tipo="105102", desc="Cancelamento de NFS-e por Substituicao",
+), chave(2))
+
 MAX_NSU = len(DOCS)
 
 

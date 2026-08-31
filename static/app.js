@@ -265,6 +265,7 @@ async function baixarLote(escopo, formato) {
   } else {
     corpo.inicio = $("data-inicio").value;
     corpo.fim = $("data-fim").value;
+    if (escopo === "validas") corpo.apenas_validas = true;
   }
   toast(formato === "xml_pdf"
     ? "Preparando ZIP (baixando DANFSes do Portal Nacional, aguarde)..."

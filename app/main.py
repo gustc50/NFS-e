@@ -411,6 +411,7 @@ class DownloadLote(BaseModel):
     inicio: str = ""
     fim: str = ""
     formato: str = "xml"              # "xml" | "xml_pdf"
+    apenas_validas: bool = False      # exclui canceladas e substituídas
 
 
 _PASTAS_PAPEL = {"emitida": "Emitidas", "recebida": "Recebidas", "intermediada": "Intermediadas"}
@@ -437,6 +438,9 @@ def baixar_lote(empresa_id: int, pedido: DownloadLote):
     else:
         notas = _consultar_notas(empresa_id, pedido.inicio, pedido.fim)
         rotulo = f"{pedido.inicio or 'inicio'}_a_{pedido.fim or 'fim'}"
+    if pedido.apenas_validas:
+        notas = [n for n in notas if n["situacao"] == "ATIVA"]
+        rotulo = f"validas_{rotulo}"
     if not notas:
         raise HTTPException(404, "Nenhuma nota encontrada para baixar.")
 

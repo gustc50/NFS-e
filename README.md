@@ -28,9 +28,10 @@ período escolhido (data inicial → data final), o painel mostra duas colunas:
 - **Downloads**: XML da NFS-e, **DANFSe (PDF)** via API nacional e exportação
   **CSV** do período (abre no Excel);
 - **Download em lote (ZIP)**: marque notas nas caixas de seleção e use
-  **⬇ Selecionadas**, ou baixe **⬇ Todas do período** — em ambos, escolha
-  *Somente XML* ou *XML + DANFSe (PDF)*. O ZIP vem organizado nas pastas
-  `Emitidas/` e `Recebidas/`;
+  **⬇ Selecionadas**, baixe **⬇ Todas do período** ou apenas as
+  **⬇ Válidas do período** (exclui canceladas e substituídas) — em todos,
+  escolha *Somente XML* ou *XML + DANFSe (PDF)*. O ZIP vem organizado nas
+  pastas `Emitidas/` e `Recebidas/`;
 - Alerta de **vencimento do certificado** (30 dias) e teste de conexão mTLS;
 - Tudo fica **no seu computador**: banco SQLite local, senha do certificado
   criptografada (chave local em `data/.chave_secreta`).

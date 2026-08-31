@@ -79,6 +79,13 @@
             <button onclick="baixarLote('todas','xml_pdf')">XML + DANFSe (PDF)</button>
           </div>
         </details>
+        <details class="dropdown" id="dd-validas">
+          <summary class="btn" title="Baixa as notas do período, exceto canceladas e substituídas">⬇ Válidas do período ▾</summary>
+          <div class="menu">
+            <button onclick="baixarLote('validas','xml')">Somente XML (rápido)</button>
+            <button onclick="baixarLote('validas','xml_pdf')">XML + DANFSe (PDF)</button>
+          </div>
+        </details>
         <button class="btn btn-primario" id="btn-sync" onclick="sincronizar()">🔄 Sincronizar</button>
       </div>
     </div>

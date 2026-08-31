@@ -106,18 +106,19 @@ def main() -> int:
                 break
             time.sleep(0.5)
         assert st["estado"] == "concluido", st
-        assert st["docs_novos"] == 11 and st["eventos_novos"] == 1, st
-        print("✔ sincronização por NSU (11 notas + 1 evento)")
+        assert st["docs_novos"] == 11 and st["eventos_novos"] == 2, st
+        print("✔ sincronização por NSU (11 notas + 2 eventos)")
 
         # período julho
         _, jul = req("GET", f"{base}/api/empresas/{eid}/notas?inicio=2026-07-01&fim=2026-07-31")
         assert len(jul["emitidas"]) == 3 and len(jul["recebidas"]) == 2, jul["totais"]
-        # período junho — nota cancelada fora dos totais
+        # período junho — cancelada e substituída fora dos totais
         _, jun = req("GET", f"{base}/api/empresas/{eid}/notas?inicio=2026-06-01&fim=2026-06-30")
         canceladas = [n for n in jun["emitidas"] if n["situacao"] == "CANCELADA"]
-        assert len(canceladas) == 1, jun["emitidas"]
-        assert jun["totais"]["emitidas"]["quantidade_ativas"] == 3
-        print("✔ filtro por período e situação de cancelamento")
+        substituidas = [n for n in jun["emitidas"] if n["situacao"] == "SUBSTITUIDA"]
+        assert len(canceladas) == 1 and len(substituidas) == 1, jun["emitidas"]
+        assert jun["totais"]["emitidas"]["quantidade_ativas"] == 2
+        print("✔ filtro por período, cancelamento e substituição")
 
         # downloads
         chave = jul["emitidas"][0]["chave_acesso"]
@@ -163,6 +164,15 @@ def main() -> int:
         assert len(xmls) == 5 and len(pdfs) == 5, nomes  # 3 emitidas + 2 recebidas
         assert zf.read(pdfs[0])[:4] == b"%PDF"
         print("✔ ZIP de todas do período (XML + DANFSe)")
+
+        # apenas válidas: junho-julho tem 11 notas, sendo 1 cancelada e 1 substituída
+        zf = zip_lote({"inicio": "2026-06-01", "fim": "2026-07-31",
+                       "formato": "xml", "apenas_validas": True})
+        nomes = zf.namelist()
+        assert len(nomes) == 9, nomes
+        chaves_excluidas = {canceladas[0]["chave_acesso"], substituidas[0]["chave_acesso"]}
+        assert not any(any(c in n for c in chaves_excluidas) for n in nomes), nomes
+        print("✔ ZIP apenas de notas válidas (exclui canceladas e substituídas)")
 
         # idempotência
         req("POST", f"{base}/api/empresas/{eid}/sincronizar")
