@@ -84,18 +84,23 @@ def xml_evento(seq_nota, dh, tipo="101101", desc="Cancelamento de NFS-e"):
 </evento>"""
 
 
-# ---- monta a base de documentos distribuídos para a Alfa ----
+# ---- monta a base de documentos distribuídos ----
+# Cada documento guarda os CNPJs interessados (prestador/tomador); a
+# distribuição só entrega ao certificado que figura como ator, como no ADN real.
 DOCS = []
+ATORES = {}   # NSU -> set de CNPJs
 
 
-def add(tipo, xml, ch):
+def add(tipo, xml, ch, atores):
+    nsu = len(DOCS) + 1
     DOCS.append({
-        "NSU": len(DOCS) + 1,
+        "NSU": nsu,
         "ChaveAcesso": ch,
         "TipoDocumento": tipo,
         "ArquivoXml": base64.b64encode(gzip.compress(xml.encode())).decode(),
         "DataHoraRecebimento": "2026-07-01T10:00:00-03:00",
     })
+    ATORES[nsu] = set(atores)
 
 
 CLIENTES = [
@@ -121,7 +126,7 @@ for i, (dia, mes, valor) in enumerate([
         CNPJ_ALFA, "TECNOLOGIA ALFA LTDA", cli[0], cli[1],
         valor, valor * 0.05, valor * 0.95,
         f"Desenvolvimento e manutencao de software - parcela {seq}",
-    ), chave(seq))
+    ), chave(seq), {CNPJ_ALFA, cli[0]})
 
 # Recebidas pela Alfa (como tomadora)
 for i, (dia, mes, valor) in enumerate([
@@ -135,21 +140,35 @@ for i, (dia, mes, valor) in enumerate([
         valor, valor * 0.02, valor * 0.98,
         f"Servicos profissionais prestados - contrato {seq}",
         "Campinas - SP",
-    ), chave(seq))
+    ), chave(seq), {CNPJ_ALFA, forn[0]})
 
 # Evento: cancelamento da nota emitida seq=3 (18/06)
-add("EVENTO", xml_evento(3, "2026-06-19T11:00:00-03:00"), chave(3))
+add("EVENTO", xml_evento(3, "2026-06-19T11:00:00-03:00"), chave(3),
+    {CNPJ_ALFA, CLIENTES[2][0]})
 
 # Evento: cancelamento por substituição da nota emitida seq=2 (10/06)
 add("EVENTO", xml_evento(
     2, "2026-06-11T09:00:00-03:00",
     tipo="105102", desc="Cancelamento de NFS-e por Substituicao",
-), chave(2))
+), chave(2), {CNPJ_ALFA, CLIENTES[1][0]})
 
 MAX_NSU = len(DOCS)
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _cnpj_cliente(self):
+        """CNPJ extraído do CN do certificado do cliente (padrão 'RAZAO:CNPJ')."""
+        cert = self.connection.getpeercert() or {}
+        for rdn in cert.get("subject", ()):
+            for k, v in rdn:
+                if k == "commonName" and ":" in v:
+                    return v.rsplit(":", 1)[1]
+        return ""
+
+    def _meus_docs(self):
+        cnpj = self._cnpj_cliente()
+        return [d for d in DOCS if cnpj in ATORES.get(d["NSU"], set())]
+
     def _json(self, code, corpo):
         dados = json.dumps(corpo).encode()
         self.send_response(code)
@@ -162,22 +181,25 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/DFe/(\d+)$", self.path.split("?")[0])
         if m:
             nsu = int(m.group(1))
-            lote = [d for d in DOCS if d["NSU"] > nsu][:50]
+            meus = self._meus_docs()
+            lote = [d for d in meus if d["NSU"] > nsu][:50]
+            max_nsu = max((d["NSU"] for d in meus), default=0)
             if not lote:
                 return self._json(200, {
                     "StatusProcessamento": "NENHUM_DOCUMENTO_LOCALIZADO",
-                    "LoteDFe": [], "ultNSU": nsu, "maxNSU": MAX_NSU,
+                    "LoteDFe": [], "ultNSU": nsu, "maxNSU": max_nsu,
                 })
             return self._json(200, {
                 "StatusProcessamento": "DOCUMENTOS_LOCALIZADOS",
                 "LoteDFe": lote,
                 "ultNSU": lote[-1]["NSU"],
-                "maxNSU": MAX_NSU,
+                "maxNSU": max_nsu,
             })
         m = re.match(r"^/NFSe/([0-9A-Za-z]+)/Eventos$", self.path)
         if m:
             ch = m.group(1)
-            evts = [d for d in DOCS if d["TipoDocumento"] == "EVENTO" and d["ChaveAcesso"] == ch]
+            evts = [d for d in self._meus_docs()
+                    if d["TipoDocumento"] == "EVENTO" and d["ChaveAcesso"] == ch]
             if not evts:
                 return self._json(404, {"mensagem": "Nenhum evento"})
             return self._json(200, {"LoteDFe": evts})
@@ -196,14 +218,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"mensagem": f"rota desconhecida: {self.path}"})
 
     def log_message(self, fmt, *args):
-        cert = self.connection.getpeercert()
-        cn = ""
-        if cert:
-            for rdn in cert.get("subject", ()):
-                for k, v in rdn:
-                    if k == "commonName":
-                        cn = v
-        sys.stderr.write(f"[mock-adn] {self.command} {self.path} (cliente: {cn})\n")
+        sys.stderr.write(f"[mock-adn] {self.command} {self.path} (cliente: {self._cnpj_cliente()})\n")
 
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

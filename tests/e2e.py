@@ -174,6 +174,39 @@ def main() -> int:
         assert not any(any(c in n for c in chaves_excluidas) for n in nomes), nomes
         print("✔ ZIP apenas de notas válidas (exclui canceladas e substituídas)")
 
+        # consolidado de todas as empresas (segunda empresa entra em cena)
+        status, emp2 = req("POST", f"{base}/api/empresas",
+                           dados={"senha": "senha456", "ambiente": "producao", "nome": "Consultoria Beta"},
+                           arquivos={"certificado": ("empresa2.pfx", (certs / "empresa2.pfx").read_bytes())})
+        assert status == 201, (status, emp2)
+        req("POST", f"{base}/api/empresas/{emp2['id']}/sincronizar")
+        for _ in range(60):
+            _, st2 = req("GET", f"{base}/api/empresas/{emp2['id']}/sincronizacao")
+            if st2["estado"] != "executando":
+                break
+            time.sleep(0.5)
+        assert st2["estado"] == "concluido", st2
+        assert st2["docs_novos"] == 2, st2  # só as notas em que a Beta é prestadora
+
+        pedido = _ur.Request(
+            f"{base}/api/notas/download-geral",
+            data=json.dumps({"inicio": "2026-06-01", "fim": "2026-07-31", "formato": "xml"}).encode(),
+            method="POST", headers={"Content-Type": "application/json"},
+        )
+        with _ur.urlopen(pedido, timeout=60) as resp:
+            zf = _zip.ZipFile(_io.BytesIO(resp.read()))
+        nomes = zf.namelist()
+        xmls = [n for n in nomes if n.endswith(".xml")]
+        assert "RESUMO.txt" in nomes, nomes
+        assert len(xmls) == 11, xmls  # 9 válidas da Alfa + 2 da Beta
+        assert all(n.startswith(("11222333000181/", "99888777000155/", "RESUMO")) for n in nomes), nomes
+        assert len([n for n in xmls if n.startswith("11222333000181/")]) == 9, xmls
+        assert len([n for n in xmls if n.startswith("99888777000155/")]) == 2, xmls
+        assert not any(any(c in n for c in chaves_excluidas) for n in xmls), xmls
+        resumo = zf.read("RESUMO.txt").decode()
+        assert "11222333000181" in resumo and "99888777000155" in resumo, resumo
+        print("✔ ZIP consolidado de todas as empresas (uma subpasta por CNPJ, só válidas)")
+
         # idempotência
         req("POST", f"{base}/api/empresas/{eid}/sincronizar")
         for _ in range(60):

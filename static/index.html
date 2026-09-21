@@ -16,6 +16,17 @@
       <p>Sistema Nacional NFS-e — Ambiente de Dados Nacional</p>
     </div>
   </div>
+  <div class="topo-acoes">
+    <details class="dropdown" id="dd-geral">
+      <summary class="btn btn-claro" title="Baixa, em um único ZIP, as notas válidas do período de todas as empresas — uma subpasta por CNPJ">
+        ⬇ Todas as empresas (válidas do período) ▾
+      </summary>
+      <div class="menu">
+        <button onclick="baixarGeral('xml')">Somente XML (rápido)</button>
+        <button onclick="baixarGeral('xml_pdf')">XML + DANFSe (PDF)</button>
+      </div>
+    </details>
+  </div>
 </header>
 
 <nav class="abas" id="abas"></nav>

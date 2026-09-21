@@ -34,8 +34,21 @@ body {
   background: linear-gradient(90deg, var(--azul-escuro), var(--azul));
   color: #fff;
   padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
 }
 .topo-titulo { display: flex; align-items: center; gap: 12px; }
+.topo-acoes { display: flex; gap: 8px; align-items: center; }
+.btn-claro {
+  background: rgba(255, 255, 255, .14);
+  border-color: rgba(255, 255, 255, .35);
+  color: #fff;
+  box-shadow: none;
+}
+.btn-claro:hover { background: rgba(255, 255, 255, .24); filter: none; }
 .logo { font-size: 30px; }
 .topo h1 { margin: 0; font-size: 19px; font-weight: 600; }
 .topo p { margin: 2px 0 0; font-size: 12px; opacity: .85; }

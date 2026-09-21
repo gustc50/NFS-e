@@ -71,6 +71,7 @@ function renderAbas() {
   nova.textContent = "＋ Nova empresa";
   nova.onclick = () => abrirModalEmpresa();
   nav.appendChild(nova);
+  $("dd-geral").classList.toggle("desabilitado", empresas.length === 0);
 }
 
 function empresa() { return empresas.find((e) => e.id === empresaAtual); }
@@ -254,24 +255,13 @@ function atualizarSelecao() {
   }
 }
 
-async function baixarLote(escopo, formato) {
+async function baixarZip(url, corpo, formato) {
   document.querySelectorAll("details.dropdown").forEach((d) => (d.open = false));
-  const emp = empresa();
-  if (!emp) return;
-  const corpo = { formato };
-  if (escopo === "selecionadas") {
-    if (selecionadas.size === 0) return toast("Marque ao menos uma nota nas caixas de seleção.", "erro");
-    corpo.chaves = [...selecionadas];
-  } else {
-    corpo.inicio = $("data-inicio").value;
-    corpo.fim = $("data-fim").value;
-    if (escopo === "validas") corpo.apenas_validas = true;
-  }
   toast(formato === "xml_pdf"
     ? "Preparando ZIP (baixando DANFSes do Portal Nacional, aguarde)..."
     : "Preparando arquivo ZIP...");
   try {
-    const resp = await fetch(`/api/empresas/${emp.id}/notas/download`, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(corpo),
@@ -293,6 +283,37 @@ async function baixarLote(escopo, formato) {
   } catch (e) {
     toast(e.message, "erro");
   }
+}
+
+async function baixarLote(escopo, formato) {
+  const emp = empresa();
+  if (!emp) return;
+  const corpo = { formato };
+  if (escopo === "selecionadas") {
+    if (selecionadas.size === 0) {
+      document.querySelectorAll("details.dropdown").forEach((d) => (d.open = false));
+      return toast("Marque ao menos uma nota nas caixas de seleção.", "erro");
+    }
+    corpo.chaves = [...selecionadas];
+  } else {
+    corpo.inicio = $("data-inicio").value;
+    corpo.fim = $("data-fim").value;
+    if (escopo === "validas") corpo.apenas_validas = true;
+  }
+  await baixarZip(`/api/empresas/${emp.id}/notas/download`, corpo, formato);
+}
+
+/* Consolidado: todas as empresas, só notas válidas, uma subpasta por CNPJ. */
+async function baixarGeral(formato) {
+  if (!empresas.length) {
+    document.querySelectorAll("details.dropdown").forEach((d) => (d.open = false));
+    return toast("Cadastre ao menos uma empresa antes de baixar.", "erro");
+  }
+  await baixarZip("/api/notas/download-geral", {
+    inicio: $("data-inicio").value,
+    fim: $("data-fim").value,
+    formato,
+  }, formato);
 }
 
 /* ------------------------------------------------ sincronização */

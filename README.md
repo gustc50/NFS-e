@@ -32,6 +32,10 @@ período escolhido (data inicial → data final), o painel mostra duas colunas:
   **⬇ Válidas do período** (exclui canceladas e substituídas) — em todos,
   escolha *Somente XML* ou *XML + DANFSe (PDF)*. O ZIP vem organizado nas
   pastas `Emitidas/` e `Recebidas/`;
+- **Download consolidado de todas as empresas**: o botão
+  **⬇ Todas as empresas (válidas do período)**, no topo da tela, gera um
+  único ZIP com **uma subpasta por CNPJ**, contendo apenas as notas válidas
+  do período selecionado, mais um `RESUMO.txt` com a contagem por empresa;
 - Alerta de **vencimento do certificado** (30 dias) e teste de conexão mTLS;
 - Tudo fica **no seu computador**: banco SQLite local, senha do certificado
   criptografada (chave local em `data/.chave_secreta`).
@@ -78,6 +82,10 @@ python run.py --port 9000 --no-browser   # opções
    e os totais são recalculados na hora (consulta local, instantânea).
 4. Clique numa nota para ver os detalhes (valores, ISS, discriminação, chave
    de acesso, eventos) ou use os botões **XML** / **PDF** / **⬇ CSV**.
+5. Para entregar tudo de uma vez à contabilidade, use
+   **⬇ Todas as empresas (válidas do período)** no topo: um ZIP só, com uma
+   pasta por CNPJ, já sem canceladas e substituídas. Sincronize cada empresa
+   antes, para que o período esteja completo.
 
 > **Frequência de sincronização:** o manual do ADN pede intervalo mínimo de
 > **1 hora** entre consultas quando não há documentos novos. Sincronize uma ou

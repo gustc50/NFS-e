@@ -417,6 +417,50 @@ class DownloadLote(BaseModel):
 _PASTAS_PAPEL = {"emitida": "Emitidas", "recebida": "Recebidas", "intermediada": "Intermediadas"}
 
 
+def _gravar_notas_no_zip(zf, empresa, notas, formato: str, prefixo: str,
+                         avisos: list[str], tolerar_erro_certificado: bool) -> None:
+    """Grava os XMLs (e, se pedido, os PDFs) de uma empresa dentro do ZIP.
+
+    ``prefixo`` permite aninhar as notas em uma subpasta (usado no download
+    consolidado, onde cada empresa fica em uma pasta com seu CNPJ).
+    """
+    cliente = None
+    try:
+        if formato == "xml_pdf":
+            try:
+                cliente = _criar_cliente(empresa)
+            except (AdnErro, CertificadoInvalido) as exc:
+                if not tolerar_erro_certificado:
+                    raise
+                avisos.append(
+                    f"{empresa['nome']} ({empresa['cnpj']}): apenas XML — "
+                    f"não foi possível usar o certificado para baixar os PDFs ({exc})."
+                )
+        for nota in notas:
+            pasta = f"{prefixo}{_PASTAS_PAPEL.get(nota['papel'], 'Outras')}"
+            nome = f"NFSe_{nota['numero'] or 'sn'}_{nota['chave_acesso']}"
+            zf.writestr(f"{pasta}/{nome}.xml", gzip.decompress(nota["xml_gzip"]))
+            if formato == "xml_pdf" and cliente is not None:
+                try:
+                    zf.writestr(f"{pasta}/{nome}.pdf",
+                                _obter_danfse_bytes(empresa, nota["chave_acesso"], cliente))
+                except (AdnErro, CertificadoInvalido) as exc:
+                    avisos.append(
+                        f"{empresa['cnpj']} — nota {nota['numero']} "
+                        f"({nota['chave_acesso']}): DANFSe indisponível — {exc}"
+                    )
+    finally:
+        if cliente is not None:
+            cliente.fechar()
+
+
+def _texto_avisos(avisos: list[str]) -> str:
+    return (
+        "Os XMLs abaixo foram incluídos, mas o PDF (DANFSe) não pôde ser baixado:\r\n\r\n"
+        + "\r\n".join(avisos)
+    )
+
+
 @app.post("/api/empresas/{empresa_id}/notas/download")
 def baixar_lote(empresa_id: int, pedido: DownloadLote):
     empresa = _empresa_ou_404(empresa_id)
@@ -446,32 +490,73 @@ def baixar_lote(empresa_id: int, pedido: DownloadLote):
 
     avisos: list[str] = []
     buffer = io.BytesIO()
-    cliente = None
     try:
-        if pedido.formato == "xml_pdf":
-            cliente = _criar_cliente(empresa)
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for nota in notas:
-                pasta = _PASTAS_PAPEL.get(nota["papel"], "Outras")
-                nome = f"NFSe_{nota['numero'] or 'sn'}_{nota['chave_acesso']}"
-                zf.writestr(f"{pasta}/{nome}.xml", gzip.decompress(nota["xml_gzip"]))
-                if pedido.formato == "xml_pdf":
-                    try:
-                        pdf = _obter_danfse_bytes(empresa, nota["chave_acesso"], cliente)
-                        zf.writestr(f"{pasta}/{nome}.pdf", pdf)
-                    except (AdnErro, CertificadoInvalido) as exc:
-                        avisos.append(f"Nota {nota['numero']} ({nota['chave_acesso']}): DANFSe indisponível — {exc}")
+            _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, "", avisos,
+                                 tolerar_erro_certificado=False)
             if avisos:
-                zf.writestr(
-                    "AVISOS.txt",
-                    "Os XMLs abaixo foram incluídos, mas o PDF (DANFSe) não pôde ser baixado:\r\n\r\n"
-                    + "\r\n".join(avisos),
-                )
-    finally:
-        if cliente is not None:
-            cliente.fechar()
+                zf.writestr("AVISOS.txt", _texto_avisos(avisos))
+    except (AdnErro, CertificadoInvalido) as exc:
+        raise HTTPException(502, str(exc)) from exc
 
     nome_zip = f"NFSe_{empresa['cnpj']}_{rotulo}.zip"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{nome_zip}"'},
+    )
+
+
+class DownloadGeral(BaseModel):
+    inicio: str = ""
+    fim: str = ""
+    formato: str = "xml"   # "xml" | "xml_pdf"
+
+
+@app.post("/api/notas/download-geral")
+def baixar_todas_empresas(pedido: DownloadGeral):
+    """ZIP consolidado: uma subpasta por CNPJ, só notas válidas do período."""
+    if pedido.formato not in ("xml", "xml_pdf"):
+        raise HTTPException(400, "Formato inválido.")
+    with db.conexao() as con:
+        empresas = con.execute("SELECT * FROM empresas ORDER BY nome COLLATE NOCASE").fetchall()
+    if not empresas:
+        raise HTTPException(404, "Nenhuma empresa cadastrada.")
+
+    avisos: list[str] = []
+    resumo: list[str] = []
+    total = 0
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for empresa in empresas:
+            notas = [n for n in _consultar_notas(empresa["id"], pedido.inicio, pedido.fim)
+                     if n["situacao"] == "ATIVA"]
+            emitidas = sum(1 for n in notas if n["papel"] == "emitida")
+            resumo.append(
+                f"{empresa['cnpj']}  {empresa['nome']}: {len(notas)} nota(s) válida(s) "
+                f"({emitidas} emitida(s), {len(notas) - emitidas} recebida(s)/outras)"
+                + ("" if notas else "  — nada no período")
+            )
+            total += len(notas)
+            if not notas:
+                continue
+            _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, f"{empresa['cnpj']}/",
+                                 avisos, tolerar_erro_certificado=True)
+        if total == 0:
+            raise HTTPException(404, "Nenhuma nota válida encontrada no período para as empresas cadastradas.")
+        zf.writestr(
+            "RESUMO.txt",
+            "NFS-e — download consolidado (somente notas válidas)\r\n"
+            f"Período: {pedido.inicio or 'início'} a {pedido.fim or 'fim'}\r\n"
+            f"Gerado em: {dt.datetime.now().strftime('%d/%m/%Y %H:%M')}\r\n"
+            "Canceladas e substituídas não estão incluídas.\r\n\r\n"
+            + "\r\n".join(resumo)
+            + f"\r\n\r\nTotal: {total} nota(s) em {len(empresas)} empresa(s).\r\n",
+        )
+        if avisos:
+            zf.writestr("AVISOS.txt", _texto_avisos(avisos))
+
+    nome_zip = f"NFSe_todas_empresas_validas_{pedido.inicio or 'inicio'}_a_{pedido.fim or 'fim'}.zip"
     return Response(
         content=buffer.getvalue(),
         media_type="application/zip",
