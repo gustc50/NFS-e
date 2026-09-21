@@ -34,8 +34,9 @@ período escolhido (data inicial → data final), o painel mostra duas colunas:
   pastas `Emitidas/` e `Recebidas/`;
 - **Download consolidado de todas as empresas**: o botão
   **⬇ Todas as empresas (válidas do período)**, no topo da tela, gera um
-  único ZIP com **uma subpasta por CNPJ**, contendo apenas as notas válidas
-  do período selecionado, mais um `RESUMO.txt` com a contagem por empresa;
+  único ZIP — **`NFSe Baixadas.zip`** — com **uma subpasta por CNPJ**,
+  contendo apenas as notas válidas do período selecionado, mais um
+  `RESUMO.txt` com a contagem por empresa;
 - Alerta de **vencimento do certificado** (30 dias) e teste de conexão mTLS;
 - Tudo fica **no seu computador**: banco SQLite local, senha do certificado
   criptografada (chave local em `data/.chave_secreta`).

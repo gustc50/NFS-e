@@ -194,6 +194,8 @@ def main() -> int:
             method="POST", headers={"Content-Type": "application/json"},
         )
         with _ur.urlopen(pedido, timeout=60) as resp:
+            assert 'filename="NFSe Baixadas.zip"' in resp.headers["Content-Disposition"], \
+                resp.headers["Content-Disposition"]
             zf = _zip.ZipFile(_io.BytesIO(resp.read()))
         nomes = zf.namelist()
         xmls = [n for n in nomes if n.endswith(".xml")]

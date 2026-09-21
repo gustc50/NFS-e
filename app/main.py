@@ -556,11 +556,10 @@ def baixar_todas_empresas(pedido: DownloadGeral):
         if avisos:
             zf.writestr("AVISOS.txt", _texto_avisos(avisos))
 
-    nome_zip = f"NFSe_todas_empresas_validas_{pedido.inicio or 'inicio'}_a_{pedido.fim or 'fim'}.zip"
     return Response(
         content=buffer.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{nome_zip}"'},
+        headers={"Content-Disposition": 'attachment; filename="NFSe Baixadas.zip"'},
     )
 
 
