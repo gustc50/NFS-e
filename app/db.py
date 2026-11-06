@@ -92,3 +92,7 @@ def conexao():
 def inicializar() -> None:
     with conexao() as con:
         con.executescript(SCHEMA)
+        colunas = {linha["name"] for linha in con.execute("PRAGMA table_info(empresas)")}
+        # Documento do certificado, quando difere do CNPJ consultado (procuração).
+        if "cert_documento" not in colunas:
+            con.execute("ALTER TABLE empresas ADD COLUMN cert_documento TEXT")

@@ -18,18 +18,17 @@ CA_EXTRA_PATH = os.environ.get("NFSE_CA_EXTRA", str(DATA_DIR / "ca_extra.pem"))
 
 # Permite apontar para um servidor de testes local (usado nos testes automatizados).
 ADN_BASE_OVERRIDE = os.environ.get("NFSE_ADN_BASE")
-SEFIN_BASE_OVERRIDE = os.environ.get("NFSE_SEFIN_BASE")
 
+# Só a API de distribuição do ADN é usada: o DANFSe é gerado localmente,
+# porque a API nacional de DANFSe foi desligada em 03/08/2026 (NT 008/2026).
 AMBIENTES = {
     "producao": {
         "nome": "Produção",
         "adn": "https://adn.nfse.gov.br/contribuintes",
-        "sefin": "https://sefin.nfse.gov.br/sefinnacional",
     },
     "producao_restrita": {
         "nome": "Produção Restrita (testes)",
         "adn": "https://adn.producaorestrita.nfse.gov.br/contribuintes",
-        "sefin": "https://sefin.producaorestrita.nfse.gov.br/sefinnacional",
     },
 }
 
@@ -41,8 +40,8 @@ REQUEST_TIMEOUT = 90.0  # segundos
 # Pausa entre chamadas consecutivas de distribuição (educação com o ADN)
 PAUSA_ENTRE_LOTES = 1.0
 
-# O manual do ADN pede intervalo mínimo de 1h entre consultas quando não há
-# documentos novos (ultNSU == maxNSU). Guardamos o horário e avisamos na UI.
+# O manual do ADN pede intervalo mínimo de 1h entre consultas quando a
+# distribuição chega ao fim (sem documentos novos). Avisado na UI.
 INTERVALO_MINIMO_SYNC = 3600  # segundos
 
 
@@ -50,12 +49,6 @@ def url_adn(ambiente: str) -> str:
     if ADN_BASE_OVERRIDE:
         return ADN_BASE_OVERRIDE.rstrip("/")
     return AMBIENTES[ambiente]["adn"]
-
-
-def url_sefin(ambiente: str) -> str:
-    if SEFIN_BASE_OVERRIDE:
-        return SEFIN_BASE_OVERRIDE.rstrip("/")
-    return AMBIENTES[ambiente]["sefin"]
 
 
 def garantir_diretorios() -> None:

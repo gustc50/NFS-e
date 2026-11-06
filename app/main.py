@@ -21,8 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, db, security
-from .adn_client import AdnClient, AdnErro
+from .adn_client import AdnClient, AdnErro, tipo_do_documento
 from .certificado import CertificadoInvalido, criar_ssl_context, inspecionar
+from .danfse import obter_danfse
 from .sync import sync_manager
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -66,11 +67,15 @@ def _serializar_empresa(row) -> dict:
         total = con.execute(
             "SELECT COUNT(*) AS n FROM notas WHERE empresa_id = ?", (row["id"],)
         ).fetchone()["n"]
+    cert_doc = row["cert_documento"] or row["cnpj"]
     return {
         "id": row["id"],
         "nome": row["nome"],
         "cnpj": row["cnpj"],
         "cnpj_formatado": _formatar_documento(row["cnpj"]),
+        "cert_documento_formatado": _formatar_documento(cert_doc),
+        # Raiz diferente: o ADN só entrega as notas se houver procuração.
+        "via_procuracao": cert_doc[:8] != row["cnpj"][:8],
         "tipo_documento": row["tipo_documento"],
         "ambiente": row["ambiente"],
         "ambiente_nome": config.AMBIENTES.get(row["ambiente"], {}).get("nome", row["ambiente"]),
@@ -101,6 +106,7 @@ async def criar_empresa(
     senha: str = Form(...),
     nome: str = Form(""),
     ambiente: str = Form("producao"),
+    cnpj_consulta: str = Form(""),
 ):
     if ambiente not in config.AMBIENTES:
         raise HTTPException(400, "Ambiente inválido.")
@@ -116,9 +122,19 @@ async def criar_empresa(
     if info.expirado:
         raise HTTPException(400, f"Certificado vencido em {info.valido_ate}. Renove antes de cadastrar.")
 
+    # Em branco: as notas do próprio titular do certificado. Preenchido: outra
+    # empresa que deu procuração eletrônica ao certificado (ex.: cliente de
+    # escritório contábil usando o e-CNPJ do escritório).
+    documento = re.sub(r"\D", "", cnpj_consulta) or info.documento
+    if len(documento) not in (11, 14):
+        raise HTTPException(400, "CNPJ a consultar inválido: informe 14 dígitos (ou 11 para CPF).")
+    procuracao = documento[:8] != info.documento[:8]
+    if procuracao and not nome.strip():
+        raise HTTPException(400, "Informe o nome de exibição da empresa consultada por procuração.")
+
     with db.conexao() as con:
         existente = con.execute(
-            "SELECT id FROM empresas WHERE cnpj = ? AND ambiente = ?", (info.documento, ambiente)
+            "SELECT id FROM empresas WHERE cnpj = ? AND ambiente = ?", (documento, ambiente)
         ).fetchone()
         if existente:
             raise HTTPException(409, "Já existe uma empresa cadastrada com este CNPJ neste ambiente.")
@@ -131,18 +147,19 @@ async def criar_empresa(
         cursor = con.execute(
             """
             INSERT INTO empresas (nome, cnpj, tipo_documento, ambiente, cert_arquivo,
-                                  senha_cripto, cert_titular, cert_valido_ate)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                  senha_cripto, cert_titular, cert_valido_ate, cert_documento)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                nome.strip() or info.titular or _formatar_documento(info.documento),
-                info.documento,
-                info.tipo_documento,
+                nome.strip() or info.titular or _formatar_documento(documento),
+                documento,
+                tipo_do_documento(documento),
                 ambiente,
                 nome_arquivo,
                 security.criptografar(senha),
                 info.titular,
                 info.valido_ate,
+                info.documento,
             ),
         )
         empresa_id = cursor.lastrowid
@@ -178,17 +195,17 @@ async def atualizar_empresa(
             info = inspecionar(pfx_bytes, senha)
         except CertificadoInvalido as exc:
             raise HTTPException(400, str(exc)) from exc
-        if info.documento != empresa["cnpj"]:
-            raise HTTPException(
-                400,
-                "O novo certificado pertence a outro CNPJ/CPF. "
-                "Cadastre uma nova empresa para trocar o documento.",
-            )
+        if info.expirado:
+            raise HTTPException(400, f"Certificado vencido em {info.valido_ate}.")
+        # O CNPJ consultado (a aba) não muda; o certificado pode ser de outro
+        # titular, desde que tenha procuração — o ADN confere na consulta.
         nome_arquivo = f"{uuid.uuid4().hex}.pfx"
         (config.CERT_DIR / nome_arquivo).write_bytes(pfx_bytes)
         antigo = config.CERT_DIR / empresa["cert_arquivo"]
-        campos += ["cert_arquivo = ?", "senha_cripto = ?", "cert_titular = ?", "cert_valido_ate = ?"]
-        valores += [nome_arquivo, security.criptografar(senha), info.titular, info.valido_ate]
+        campos += ["cert_arquivo = ?", "senha_cripto = ?", "cert_titular = ?",
+                   "cert_valido_ate = ?", "cert_documento = ?"]
+        valores += [nome_arquivo, security.criptografar(senha), info.titular,
+                    info.valido_ate, info.documento]
         if antigo.exists():
             antigo.unlink()
     elif senha:
@@ -216,13 +233,24 @@ def excluir_empresa(empresa_id: int):
 
 @app.post("/api/empresas/{empresa_id}/testar")
 def testar_conexao(empresa_id: int):
+    """Consulta real ao ADN (NSU 0) devolvendo o diagnóstico completo:
+    URL chamada, HTTP, TipoConsulta, StatusProcessamento, Erros e Alertas."""
     empresa = _empresa_ou_404(empresa_id)
     try:
         with _criar_cliente(empresa) as cliente:
-            mensagem = cliente.testar_conexao(int(empresa["ultimo_nsu"] or 0))
+            resultado = cliente.testar_conexao()
     except (AdnErro, CertificadoInvalido) as exc:
-        raise HTTPException(502, str(exc)) from exc
-    return {"ok": True, "mensagem": mensagem}
+        diag = getattr(exc, "diagnostico", None)
+        resultado = {"ok": False, "mensagem": str(exc),
+                     "diagnostico": diag.como_dict() if diag else None}
+    resultado["empresa"] = {
+        "cnpj_consultado": empresa["cnpj"],
+        "certificado": empresa["cert_documento"] or empresa["cnpj"],
+        "titular_certificado": empresa["cert_titular"],
+        "validade_certificado": empresa["cert_valido_ate"],
+        "ambiente": empresa["ambiente"],
+    }
+    return resultado
 
 
 # ------------------------------------------------------------- sincronização
@@ -374,33 +402,20 @@ def _criar_cliente(empresa) -> AdnClient:
     pfx_bytes = (config.CERT_DIR / empresa["cert_arquivo"]).read_bytes()
     senha = security.descriptografar(empresa["senha_cripto"])
     ctx = criar_ssl_context(pfx_bytes, senha)
-    return AdnClient(empresa["ambiente"], ctx,
-                     documento_consulta=empresa["cnpj"],
-                     tipo_documento=empresa["tipo_documento"])
+    return AdnClient(empresa["ambiente"], ctx, documento_consulta=empresa["cnpj"])
 
 
-def _obter_danfse_bytes(empresa, chave: str, cliente: AdnClient | None = None) -> bytes:
-    """PDF da nota, com cache local em ``data/danfse``."""
-    cache = config.DANFSE_CACHE_DIR / f"{chave}.pdf"
-    if cache.exists():
-        return cache.read_bytes()
-    if cliente is None:
-        with _criar_cliente(empresa) as novo:
-            pdf = novo.baixar_danfse(chave)
-    else:
-        pdf = cliente.baixar_danfse(chave)
-    cache.write_bytes(pdf)
-    return pdf
+def _danfse_da_nota(nota) -> bytes:
+    return obter_danfse(nota["chave_acesso"], gzip.decompress(nota["xml_gzip"]), nota["situacao"])
 
 
 @app.get("/api/empresas/{empresa_id}/notas/{chave}/danfse")
 def baixar_danfse(empresa_id: int, chave: str):
-    empresa = _empresa_ou_404(empresa_id)
-    _nota_ou_404(empresa_id, chave)
+    nota = _nota_ou_404(empresa_id, chave)
     try:
-        pdf = _obter_danfse_bytes(empresa, chave)
-    except (AdnErro, CertificadoInvalido) as exc:
-        raise HTTPException(502, str(exc)) from exc
+        pdf = _danfse_da_nota(nota)
+    except Exception as exc:  # noqa: BLE001 — XML fora do leiaute esperado
+        raise HTTPException(500, f"Não foi possível gerar o DANFSe desta nota: {exc}") from exc
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -420,45 +435,30 @@ _PASTAS_PAPEL = {"emitida": "Emitidas", "recebida": "Recebidas", "intermediada":
 
 
 def _gravar_notas_no_zip(zf, empresa, notas, formato: str, prefixo: str,
-                         avisos: list[str], tolerar_erro_certificado: bool) -> None:
+                         avisos: list[str]) -> None:
     """Grava os XMLs (e, se pedido, os PDFs) de uma empresa dentro do ZIP.
 
     ``prefixo`` permite aninhar as notas em uma subpasta (usado no download
-    consolidado, onde cada empresa fica em uma pasta com seu CNPJ).
+    consolidado, onde cada empresa fica em uma pasta com seu CNPJ). O DANFSe
+    é gerado localmente a partir do XML — não depende de certificado nem rede.
     """
-    cliente = None
-    try:
+    for nota in notas:
+        pasta = f"{prefixo}{_PASTAS_PAPEL.get(nota['papel'], 'Outras')}"
+        nome = f"NFSe_{nota['numero'] or 'sn'}_{nota['chave_acesso']}"
+        zf.writestr(f"{pasta}/{nome}.xml", gzip.decompress(nota["xml_gzip"]))
         if formato == "xml_pdf":
             try:
-                cliente = _criar_cliente(empresa)
-            except (AdnErro, CertificadoInvalido) as exc:
-                if not tolerar_erro_certificado:
-                    raise
+                zf.writestr(f"{pasta}/{nome}.pdf", _danfse_da_nota(nota))
+            except Exception as exc:  # noqa: BLE001 — um PDF ruim não derruba o ZIP
                 avisos.append(
-                    f"{empresa['nome']} ({empresa['cnpj']}): apenas XML — "
-                    f"não foi possível usar o certificado para baixar os PDFs ({exc})."
+                    f"{empresa['cnpj']} — nota {nota['numero']} "
+                    f"({nota['chave_acesso']}): DANFSe não gerado — {exc}"
                 )
-        for nota in notas:
-            pasta = f"{prefixo}{_PASTAS_PAPEL.get(nota['papel'], 'Outras')}"
-            nome = f"NFSe_{nota['numero'] or 'sn'}_{nota['chave_acesso']}"
-            zf.writestr(f"{pasta}/{nome}.xml", gzip.decompress(nota["xml_gzip"]))
-            if formato == "xml_pdf" and cliente is not None:
-                try:
-                    zf.writestr(f"{pasta}/{nome}.pdf",
-                                _obter_danfse_bytes(empresa, nota["chave_acesso"], cliente))
-                except (AdnErro, CertificadoInvalido) as exc:
-                    avisos.append(
-                        f"{empresa['cnpj']} — nota {nota['numero']} "
-                        f"({nota['chave_acesso']}): DANFSe indisponível — {exc}"
-                    )
-    finally:
-        if cliente is not None:
-            cliente.fechar()
 
 
 def _texto_avisos(avisos: list[str]) -> str:
     return (
-        "Os XMLs abaixo foram incluídos, mas o PDF (DANFSe) não pôde ser baixado:\r\n\r\n"
+        "Os XMLs abaixo foram incluídos, mas o PDF (DANFSe) não pôde ser gerado:\r\n\r\n"
         + "\r\n".join(avisos)
     )
 
@@ -492,14 +492,10 @@ def baixar_lote(empresa_id: int, pedido: DownloadLote):
 
     avisos: list[str] = []
     buffer = io.BytesIO()
-    try:
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, "", avisos,
-                                 tolerar_erro_certificado=False)
-            if avisos:
-                zf.writestr("AVISOS.txt", _texto_avisos(avisos))
-    except (AdnErro, CertificadoInvalido) as exc:
-        raise HTTPException(502, str(exc)) from exc
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, "", avisos)
+        if avisos:
+            zf.writestr("AVISOS.txt", _texto_avisos(avisos))
 
     nome_zip = f"NFSe_{empresa['cnpj']}_{rotulo}.zip"
     return Response(
@@ -542,8 +538,7 @@ def baixar_todas_empresas(pedido: DownloadGeral):
             total += len(notas)
             if not notas:
                 continue
-            _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, f"{empresa['cnpj']}/",
-                                 avisos, tolerar_erro_certificado=True)
+            _gravar_notas_no_zip(zf, empresa, notas, pedido.formato, f"{empresa['cnpj']}/", avisos)
         if total == 0:
             raise HTTPException(404, "Nenhuma nota válida encontrada no período para as empresas cadastradas.")
         zf.writestr(

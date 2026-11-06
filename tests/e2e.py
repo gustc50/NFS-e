@@ -77,8 +77,7 @@ def main() -> int:
     mock = subprocess.Popen([sys.executable, str(RAIZ / "tests/mock_adn.py"), str(certs), str(porta_mock)])
     env = dict(os.environ,
                NFSE_DATA_DIR=str(dados),
-               NFSE_ADN_BASE=f"https://localhost:{porta_mock}",
-               NFSE_SEFIN_BASE=f"https://localhost:{porta_mock}")
+               NFSE_ADN_BASE=f"https://localhost:{porta_mock}")
     app = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", str(porta_app), "--log-level", "warning"],
@@ -106,30 +105,44 @@ def main() -> int:
                 break
             time.sleep(0.5)
         assert st["estado"] == "concluido", st
-        assert st["docs_novos"] == 11 and st["eventos_novos"] == 2, st
-        print("✔ sincronização por NSU (11 notas + 2 eventos)")
+        # 15 documentos em lotes de 5, sem maxNSU na resposta: só chega a
+        # todos se continuar lendo até o 404 (regressão da parada prematura).
+        assert st["docs_novos"] == 11 and st["eventos_novos"] == 4, st
+        assert not st.get("ilegiveis"), st
+        print("✔ sincronização por NSU em vários lotes até o 404 (11 notas + 4 eventos)")
 
-        # regressão: desde 03/11/2026 o ADN exige cnpjConsulta na distribuição
-        os.environ["NFSE_DATA_DIR"] = str(dados)
-        os.environ["NFSE_ADN_BASE"] = f"https://localhost:{porta_mock}"
-        os.environ["NFSE_SEFIN_BASE"] = f"https://localhost:{porta_mock}"
+        # diagnóstico: a consulta real vai com lote=true&cnpjConsulta
+        _, diag = req("POST", f"{base}/api/empresas/{eid}/testar")
+        assert diag["ok"], diag
+        d = diag["diagnostico"]
+        assert "lote=true" in d["url"] and "cnpjConsulta=11222333000181" in d["url"], d
+        assert d["tipo_consulta"] == "CnpjBase" and d["http_status"] == 200, d
+        print("✔ testar conexão: URL com lote=true&cnpjConsulta e TipoConsulta CnpjBase")
+
+        # decodificação de base64 URL-safe, com quebras de linha e sem padding
         sys.path.insert(0, str(RAIZ))
-        from app.adn_client import AdnClient, AdnErro
-        from app.certificado import criar_ssl_context
+        import base64 as _b64
+        import gzip as _gz
+        from app.xml_nfse import decodificar_arquivo_xml, situacao_por_evento
+        amostra = b"<?xml version='1.0'?><NFSe>" + b"\xff\xfe\xfd" * 40 + b"</NFSe>"
+        codificado = _b64.urlsafe_b64encode(_gz.compress(amostra)).decode().rstrip("=")
+        codificado = "\n".join(codificado[i:i + 60] for i in range(0, len(codificado), 60))
+        assert decodificar_arquivo_xml(codificado) == amostra
+        try:
+            decodificar_arquivo_xml(_b64.b64encode(b"isto nao e xml").decode())
+            raise AssertionError("conteúdo que não é XML deveria ser recusado")
+        except ValueError:
+            pass
+        print("✔ base64 URL-safe/quebrado decodificado; conteúdo inválido não passa calado")
 
-        pfx = (certs / "empresa1.pfx").read_bytes()
-        with AdnClient("producao", criar_ssl_context(pfx, "senha123")) as sem_cnpj:
-            try:
-                sem_cnpj.distribuir_dfe(0)
-                raise AssertionError("o ADN deveria rejeitar a consulta sem cnpjConsulta")
-            except AdnErro as exc:
-                assert "InscricaoCertificado" in str(exc), exc
-                assert "rejeitou" in str(exc), exc  # mensagem explicativa, não JSON cru
-        with AdnClient("producao", criar_ssl_context(pfx, "senha123"),
-                       documento_consulta="11222333000181") as com_cnpj:
-            resposta = com_cnpj.distribuir_dfe(0)
-            assert resposta.documentos, "com cnpjConsulta a distribuição deve responder"
-        print("✔ distribuição envia cnpjConsulta (regressão do HTTP 400 / REJEICAO)")
+        # regra de eventos pelo código do leiaute nacional
+        assert situacao_por_evento("101101", "") == "CANCELADA"
+        assert situacao_por_evento("105104", "") == "CANCELADA"
+        assert situacao_por_evento("305101", "") == "CANCELADA"
+        assert situacao_por_evento("105102", "") == "SUBSTITUIDA"
+        for nao_cancela in ("305102", "305103", "101103", "105105"):
+            assert situacao_por_evento(nao_cancela, "Cancelamento ...") is None, nao_cancela
+        print("✔ eventos: bloqueio, desbloqueio, solicitação e indeferimento não cancelam")
 
         # período julho
         _, jul = req("GET", f"{base}/api/empresas/{eid}/notas?inicio=2026-07-01&fim=2026-07-31")
@@ -140,14 +153,20 @@ def main() -> int:
         substituidas = [n for n in jun["emitidas"] if n["situacao"] == "SUBSTITUIDA"]
         assert len(canceladas) == 1 and len(substituidas) == 1, jun["emitidas"]
         assert jun["totais"]["emitidas"]["quantidade_ativas"] == 2
-        print("✔ filtro por período, cancelamento e substituição")
+        bloqueada = [n for n in jun["emitidas"] if n["numero"] == "104"][0]
+        assert bloqueada["situacao"] == "ATIVA", bloqueada  # bloqueio por ofício
+        print("✔ filtro por período, cancelamento e substituição (bloqueada segue ativa)")
 
         # downloads
         chave = jul["emitidas"][0]["chave_acesso"]
         status, xml = req("GET", f"{base}/api/empresas/{eid}/notas/{chave}/xml")
         assert status == 200 and xml.lstrip().startswith(b"<?xml"), status
+        # DANFSe gerado localmente (o mock não tem mais a rota /danfse)
         status, pdf = req("GET", f"{base}/api/empresas/{eid}/notas/{chave}/danfse")
-        assert status == 200 and pdf[:4] == b"%PDF", status
+        assert status == 200 and pdf[:4] == b"%PDF" and len(pdf) > 20000, (status, len(pdf))
+        chave_canc = canceladas[0]["chave_acesso"]
+        status, pdf_canc = req("GET", f"{base}/api/empresas/{eid}/notas/{chave_canc}/danfse")
+        assert status == 200 and pdf_canc[:4] == b"%PDF" and pdf_canc != pdf
         status, csv_ = req("GET", f"{base}/api/empresas/{eid}/notas.csv?inicio=2026-06-01&fim=2026-07-31")
         assert status == 200 and "Chave de Acesso" in csv_.decode("utf-8-sig")[:200]
         print("✔ downloads XML / DANFSe / CSV")
@@ -230,6 +249,41 @@ def main() -> int:
         resumo = zf.read("RESUMO.txt").decode()
         assert "11222333000181" in resumo and "99888777000155" in resumo, resumo
         print("✔ ZIP consolidado de todas as empresas (uma subpasta por CNPJ, só válidas)")
+
+        def sincronizar_e_esperar(id_empresa):
+            req("POST", f"{base}/api/empresas/{id_empresa}/sincronizar")
+            for _ in range(60):
+                _, estado = req("GET", f"{base}/api/empresas/{id_empresa}/sincronizacao")
+                if estado["estado"] != "executando":
+                    return estado
+                time.sleep(0.5)
+            raise AssertionError("sincronização não terminou")
+
+        # procuração: certificado da Beta consultando a Gama (que outorgou)
+        status, gama = req("POST", f"{base}/api/empresas",
+                           dados={"senha": "senha456", "ambiente": "producao",
+                                  "nome": "Comercio Gama", "cnpj_consulta": "44.555.666/0001-22"},
+                           arquivos={"certificado": ("empresa2.pfx", (certs / "empresa2.pfx").read_bytes())})
+        assert status == 201 and gama["cnpj"] == "44555666000122" and gama["via_procuracao"], gama
+        st_gama = sincronizar_e_esperar(gama["id"])
+        assert st_gama["estado"] == "concluido", st_gama
+        assert st_gama["docs_novos"] == 3 and st_gama["eventos_novos"] == 1, st_gama
+        _, notas_gama = req("GET", f"{base}/api/empresas/{gama['id']}/notas")
+        assert len(notas_gama["recebidas"]) == 3 and not notas_gama["emitidas"], notas_gama["totais"]
+        print("✔ procuração: certificado de outro CNPJ consulta a empresa outorgante")
+
+        # sem procuração: o ADN responde E2245 e a mensagem explica o motivo
+        status, delta = req("POST", f"{base}/api/empresas",
+                            dados={"senha": "senha456", "ambiente": "producao",
+                                   "nome": "Industria Delta", "cnpj_consulta": "77888999000133"},
+                            arquivos={"certificado": ("empresa2.pfx", (certs / "empresa2.pfx").read_bytes())})
+        assert status == 201, delta
+        st_delta = sincronizar_e_esperar(delta["id"])
+        assert st_delta["estado"] == "erro", st_delta
+        assert "E2245" in st_delta["mensagem"] and "procuração" in st_delta["mensagem"], st_delta
+        _, diag_delta = req("POST", f"{base}/api/empresas/{delta['id']}/testar")
+        assert not diag_delta["ok"] and diag_delta["diagnostico"]["erros"], diag_delta
+        print("✔ sem procuração: erro E2245 exibido com explicação (não mascarado)")
 
         # idempotência
         req("POST", f"{base}/api/empresas/{eid}/sincronizar")

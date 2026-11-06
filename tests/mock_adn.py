@@ -1,9 +1,11 @@
 """Servidor ADN simulado (HTTPS + mTLS) para testar o NFS-e Monitor.
 
-Simula: GET /DFe/{nsu}, GET /NFSe/{chave}/Eventos, GET /danfse/{chave}.
-Distribui notas para o CNPJ 11222333000181 (Tecnologia Alfa):
-emitidas (como prestador), recebidas (como tomador) e um evento de
-cancelamento — datas espalhadas para testar o filtro de período.
+Reproduz o comportamento observado no ADN de produção (nov/2026) da rota
+``GET /DFe/{nsu}?lote=true&cnpjConsulta={cnpj}``: rejeição sem o CNPJ
+consultado, E2245 sem procuração, fim do feed com HTTP 404 + corpo JSON,
+resposta sem ultNSU/maxNSU. Distribui notas emitidas e recebidas da
+Tecnologia Alfa (11222333000181) e eventos de cancelamento, substituição,
+bloqueio e solicitação de análise — datas espalhadas para testar o período.
 """
 import base64
 import gzip
@@ -115,6 +117,7 @@ FORNECEDORES = [
 ]
 
 seq = 0
+ATORES_DA_NOTA = {}   # seq -> atores, para distribuir os eventos aos mesmos
 # Emitidas pela Alfa — junho e julho/2026
 for i, (dia, mes, valor) in enumerate([
     (3, 6, 1500.0), (10, 6, 2300.5), (18, 6, 890.0), (25, 6, 4750.0),
@@ -122,12 +125,13 @@ for i, (dia, mes, valor) in enumerate([
 ]):
     seq += 1
     cli = CLIENTES[i % len(CLIENTES)]
+    ATORES_DA_NOTA[seq] = {CNPJ_ALFA, cli[0]}
     add("NFSE", xml_nfse(
         seq, 100 + seq, f"2026-{mes:02d}-{dia:02d}T09:30:00-03:00", f"2026-{mes:02d}-{dia:02d}",
         CNPJ_ALFA, "TECNOLOGIA ALFA LTDA", cli[0], cli[1],
         valor, valor * 0.05, valor * 0.95,
         f"Desenvolvimento e manutencao de software - parcela {seq}",
-    ), chave(seq), {CNPJ_ALFA, cli[0]})
+    ), chave(seq), ATORES_DA_NOTA[seq])
 
 # Recebidas pela Alfa (como tomadora)
 for i, (dia, mes, valor) in enumerate([
@@ -135,25 +139,40 @@ for i, (dia, mes, valor) in enumerate([
 ]):
     seq += 1
     forn = FORNECEDORES[i % len(FORNECEDORES)]
+    ATORES_DA_NOTA[seq] = {CNPJ_ALFA, forn[0]}
     add("NFSE", xml_nfse(
         seq, 500 + seq, f"2026-{mes:02d}-{dia:02d}T14:00:00-03:00", f"2026-{mes:02d}-{dia:02d}",
         forn[0], forn[1], CNPJ_ALFA, "TECNOLOGIA ALFA LTDA",
         valor, valor * 0.02, valor * 0.98,
         f"Servicos profissionais prestados - contrato {seq}",
         "Campinas - SP",
-    ), chave(seq), {CNPJ_ALFA, forn[0]})
+    ), chave(seq), ATORES_DA_NOTA[seq])
 
-# Evento: cancelamento da nota emitida seq=3 (18/06)
-add("EVENTO", xml_evento(3, "2026-06-19T11:00:00-03:00"), chave(3),
-    {CNPJ_ALFA, CLIENTES[2][0]})
-
-# Evento: cancelamento por substituição da nota emitida seq=2 (10/06)
+# Eventos (códigos do leiaute nacional):
+# 101101 cancelamento da nota seq=3 (18/06) — cancela
+add("EVENTO", xml_evento(3, "2026-06-19T11:00:00-03:00"), chave(3), ATORES_DA_NOTA[3])
+# 105102 cancelamento por substituição da nota seq=2 (10/06) — substitui
 add("EVENTO", xml_evento(
     2, "2026-06-11T09:00:00-03:00",
     tipo="105102", desc="Cancelamento de NFS-e por Substituicao",
-), chave(2), {CNPJ_ALFA, CLIENTES[1][0]})
+), chave(2), ATORES_DA_NOTA[2])
+# 305102 bloqueio por ofício da nota seq=4 — NÃO cancela
+add("EVENTO", xml_evento(
+    4, "2026-06-26T10:00:00-03:00",
+    tipo="305102", desc="Bloqueio de NFS-e por Oficio",
+), chave(4), ATORES_DA_NOTA[4])
+# 101103 solicitação de análise fiscal para cancelamento da nota seq=5 — NÃO cancela
+add("EVENTO", xml_evento(
+    5, "2026-07-03T10:00:00-03:00",
+    tipo="101103", desc="Solicitacao de Analise Fiscal para Cancelamento de NFS-e",
+), chave(5), ATORES_DA_NOTA[5])
 
 MAX_NSU = len(DOCS)
+# O ADN real devolve lotes de até 50; aqui o lote é menor para que os testes
+# exercitem a leitura em vários lotes (a resposta não informa o maior NSU).
+TAMANHO_LOTE = 5
+# Procurações eletrônicas: outorgante (empresa consultada) -> procuradores
+PROCURACOES = {"44555666000122": {"99888777000155"}}   # Gama -> Beta
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -166,9 +185,11 @@ class Handler(BaseHTTPRequestHandler):
                     return v.rsplit(":", 1)[1]
         return ""
 
-    def _meus_docs(self):
-        cnpj = self._cnpj_cliente()
-        return [d for d in DOCS if cnpj in ATORES.get(d["NSU"], set())]
+    def _docs_de(self, documento, por_raiz):
+        if por_raiz:
+            raiz = documento[:8]
+            return [d for d in DOCS if any(a[:8] == raiz for a in ATORES.get(d["NSU"], ()))]
+        return [d for d in DOCS if documento in ATORES.get(d["NSU"], ())]
 
     def _json(self, code, corpo):
         dados = json.dumps(corpo).encode()
@@ -178,71 +199,53 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(dados)
 
+    def _resposta(self, http, tipo_consulta, status, lote=(), erros=()):
+        # Mesmo formato do ADN real: sem ultNSU/maxNSU; 400 e 404 também
+        # trazem o corpo completo, e o que vale é o StatusProcessamento.
+        return self._json(http, {
+            "TipoConsulta": tipo_consulta,
+            "StatusProcessamento": status,
+            "LoteDFe": list(lote), "Alertas": [], "Erros": list(erros),
+            "TipoAmbiente": "PRODUCAO", "VersaoAplicativo": "1.0.0.0",
+            "DataHoraProcessamento": "2026-11-06T09:57:49.1098578-03:00",
+        })
+
     def do_GET(self):
         caminho = urlparse(self.path)
         query = parse_qs(caminho.query)
         m = re.match(r"^/DFe/(\d+)$", caminho.path)
-        if m:
-            nsu = int(m.group(1))
-            cnpj_cert = self._cnpj_cliente()
-            cnpj_consulta = (query.get("cnpjConsulta") or [""])[0]
-            # Desde 03/11/2026 o ADN exige o CNPJ da consulta; sem ele a
-            # resposta é HTTP 400 / REJEICAO com TipoConsulta
-            # "InscricaoCertificado" e a lista de erros vazia.
-            if not cnpj_consulta:
-                return self._json(400, {
-                    "TipoConsulta": "InscricaoCertificado",
-                    "StatusProcessamento": "REJEICAO",
-                    "LoteDFe": [], "Alertas": [], "Erros": [],
-                    "TipoAmbiente": "PRODUCAO", "VersaoAplicativo": "1.0.0.0",
-                })
-            if cnpj_consulta[:8] != cnpj_cert[:8]:
-                return self._json(400, {
-                    "TipoConsulta": "CnpjBase",
-                    "StatusProcessamento": "REJEICAO",
-                    "LoteDFe": [], "Alertas": [],
-                    "Erros": [{"Codigo": "E0001",
-                               "Descricao": "CNPJ da consulta nao corresponde ao certificado."}],
-                    "TipoAmbiente": "PRODUCAO", "VersaoAplicativo": "1.0.0.0",
-                })
+        if not m:
+            # Inclui /danfse/{chave}: a API nacional de DANFSe foi desligada
+            # em 03/08/2026 — o sistema não pode depender dela.
+            return self._json(404, {"mensagem": f"rota desconhecida: {self.path}"})
 
-            meus = self._meus_docs()
-            lote = [d for d in meus if d["NSU"] > nsu][:50]
-            max_nsu = max((d["NSU"] for d in meus), default=0)
-            if not lote:
-                return self._json(200, {
-                    "TipoConsulta": "CnpjBase",
-                    "StatusProcessamento": "NENHUM_DOCUMENTO_LOCALIZADO",
-                    "LoteDFe": [], "ultNSU": nsu, "maxNSU": max_nsu,
-                })
-            return self._json(200, {
-                "TipoConsulta": "CnpjBase",
-                "StatusProcessamento": "DOCUMENTOS_LOCALIZADOS",
-                "LoteDFe": lote,
-                "ultNSU": lote[-1]["NSU"],
-                "maxNSU": max_nsu,
-            })
-        m = re.match(r"^/NFSe/([0-9A-Za-z]+)/Eventos$", caminho.path)
-        if m:
-            ch = m.group(1)
-            evts = [d for d in self._meus_docs()
-                    if d["TipoDocumento"] == "EVENTO" and d["ChaveAcesso"] == ch]
-            if not evts:
-                return self._json(404, {"mensagem": "Nenhum evento"})
-            return self._json(200, {"LoteDFe": evts})
-        m = re.match(r"^/danfse/([0-9A-Za-z]+)$", caminho.path)
-        if m:
-            pdf = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-                   b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
-                   b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]>>endobj\n"
-                   b"xref\n0 4\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n0\n%%EOF\n")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pdf")
-            self.send_header("Content-Length", str(len(pdf)))
-            self.end_headers()
-            self.wfile.write(pdf)
-            return
-        self._json(404, {"mensagem": f"rota desconhecida: {self.path}"})
+        nsu = int(m.group(1))
+        cert = self._cnpj_cliente()
+        consulta = (query.get("cnpjConsulta") or query.get("cpfConsulta") or [""])[0]
+        # Desde 03/11/2026: sem o documento consultado → 400 sem motivo.
+        if not consulta:
+            return self._resposta(400, "InscricaoCertificado", "REJEICAO")
+        if consulta[:8] == cert[:8]:
+            tipo_consulta, docs = "CnpjBase", self._docs_de(consulta, por_raiz=True)
+        elif cert in PROCURACOES.get(consulta, ()):
+            tipo_consulta, docs = "Procuracao", self._docs_de(consulta, por_raiz=False)
+        else:
+            return self._resposta(400, "Procuracao", "REJEICAO", erros=[{
+                "Codigo": "E2245",
+                "Descricao": f"Não há procuração da inscrição {cert} para a inscrição {consulta}.",
+                "Complemento": None,
+            }])
+        if (query.get("lote") or [""])[0] != "true":
+            # Sem lote=true a rota devolve só o documento daquele NSU exato.
+            docs = [d for d in docs if d["NSU"] == nsu]
+            if not docs:
+                return self._resposta(404, tipo_consulta, "NENHUM_DOCUMENTO_LOCALIZADO")
+            return self._resposta(200, tipo_consulta, "DOCUMENTOS_LOCALIZADOS", docs)
+
+        lote = [d for d in docs if d["NSU"] > nsu][:TAMANHO_LOTE]
+        if not lote:
+            return self._resposta(404, tipo_consulta, "NENHUM_DOCUMENTO_LOCALIZADO")
+        return self._resposta(200, tipo_consulta, "DOCUMENTOS_LOCALIZADOS", lote)
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[mock-adn] {self.command} {self.path} (cliente: {self._cnpj_cliente()})\n")

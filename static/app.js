@@ -106,6 +106,10 @@ function renderPainel() {
     cert.className = "badge";
   }
 
+  const proc = $("empresa-procuracao");
+  proc.className = "badge badge-alerta" + (emp.via_procuracao ? "" : " oculto");
+  proc.textContent = `via procuração — certificado ${emp.cert_documento_formatado}`;
+
   atualizarStatusSync(emp.sincronizando);
   if (emp.sincronizando) iniciarPolling();
   carregarNotas();
@@ -258,7 +262,7 @@ function atualizarSelecao() {
 async function baixarZip(url, corpo, formato) {
   document.querySelectorAll("details.dropdown").forEach((d) => (d.open = false));
   toast(formato === "xml_pdf"
-    ? "Preparando ZIP (baixando DANFSes do Portal Nacional, aguarde)..."
+    ? "Preparando ZIP (gerando os DANFSes em PDF, aguarde)..."
     : "Preparando arquivo ZIP...");
   try {
     const resp = await fetch(url, {
@@ -372,15 +376,56 @@ function iniciarPolling() {
   }, 1500);
 }
 
+let ultimoDiagnostico = "";
+
 async function testarConexao() {
   const emp = empresa();
   if (!emp) return;
   toast("Testando conexão com o ADN...");
   try {
     const r = await api(`/api/empresas/${emp.id}/testar`, { method: "POST" });
-    toast(r.mensagem, "ok");
+    mostrarDiagnostico(r);
   } catch (e) {
     toast(e.message, "erro");
+  }
+}
+
+function mostrarDiagnostico(r) {
+  const d = r.diagnostico || {};
+  const e = r.empresa || {};
+  const resumo = $("diag-resumo");
+  resumo.className = "diag-resumo " + (r.ok ? "ok" : "erro");
+  resumo.textContent = (r.ok ? "✅ " : "❌ ") + r.mensagem;
+
+  const linhas = [
+    ["CNPJ consultado", e.cnpj_consultado],
+    ["Certificado (titular)", `${e.certificado || ""} — ${e.titular_certificado || ""}`],
+    ["Validade do certificado", e.validade_certificado],
+    ["Ambiente", e.ambiente],
+    ["URL chamada", d.url],
+    ["HTTP", d.http_status],
+    ["TipoConsulta", d.tipo_consulta],
+    ["StatusProcessamento", d.status_processamento],
+    ["Erros do ADN", (d.erros || []).join(" | ") || "—"],
+    ["Alertas do ADN", (d.alertas || []).join(" | ") || "—"],
+    ["Documentos no 1º lote", d.documentos_no_lote],
+    ["Ambiente/versão ADN", [d.tipo_ambiente, d.versao_aplicativo].filter(Boolean).join(" / ")],
+    ["Data/hora ADN", d.data_hora],
+  ];
+  $("diag-campos").innerHTML = linhas.map(([k, v]) =>
+    `<dt>${esc(k)}</dt><dd><code>${esc(v ?? "—") || "—"}</code></dd>`
+  ).join("");
+  $("toast").classList.add("oculto");
+  ultimoDiagnostico = [`Resultado: ${r.mensagem}`, ...linhas.map(([k, v]) => `${k}: ${v ?? "—"}`)].join("\n");
+  $("modal-diagnostico").classList.remove("oculto");
+}
+
+async function copiarDiagnostico() {
+  try {
+    await navigator.clipboard.writeText(ultimoDiagnostico);
+    toast("Diagnóstico copiado.", "ok");
+  } catch (_) {
+    toast("Não foi possível copiar automaticamente — selecione o texto e copie.", "erro");
   }
 }
 
@@ -390,6 +435,7 @@ function abrirModalEmpresa() {
   editando = false;
   $("modal-empresa-titulo").textContent = "Cadastrar empresa";
   $("form-empresa").reset();
+  $("campo-cnpj-consulta").classList.remove("oculto");
   $("modal-empresa-erro").classList.add("oculto");
   $("modal-empresa").classList.remove("oculto");
 }
@@ -403,6 +449,7 @@ function abrirModalEditar() {
   form.reset();
   form.nome.value = emp.nome;
   form.ambiente.value = emp.ambiente;
+  $("campo-cnpj-consulta").classList.add("oculto");  // o CNPJ da aba não muda
   $("modal-empresa-erro").classList.add("oculto");
   $("modal-empresa").classList.remove("oculto");
 }
@@ -419,6 +466,7 @@ async function salvarEmpresa(ev) {
   fd.append("ambiente", form.ambiente.value);
   if (form.certificado.files[0]) fd.append("certificado", form.certificado.files[0]);
   if (form.senha.value) fd.append("senha", form.senha.value);
+  if (!editando && form.cnpj_consulta.value.trim()) fd.append("cnpj_consulta", form.cnpj_consulta.value);
 
   if (!editando) {
     if (!form.certificado.files[0]) return mostrarErroModal("Selecione o arquivo do certificado (.pfx/.p12).");

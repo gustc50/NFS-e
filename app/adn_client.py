@@ -1,18 +1,28 @@
-"""Cliente HTTP (mTLS) das APIs do Sistema Nacional NFS-e.
+"""Cliente HTTP (mTLS) da API de distribuição do Ambiente de Dados Nacional.
 
-Endpoints usados (documentação oficial do Portal Nacional):
+Rota usada (contribuintes):
 
-* Distribuição de DF-e aos atores (emitente/tomador/intermediário):
-  ``GET {ADN}/DFe/{ultimoNSU}`` — devolve lotes de até 50 documentos.
-* Eventos por chave: ``GET {ADN}/NFSe/{chaveAcesso}/Eventos``
-* DANFSe (PDF): ``GET {SEFIN}/danfse/{chaveAcesso}``
+    GET {ADN}/DFe/{ultimoNSU}?lote=true&cnpjConsulta={CNPJ}
 
-As respostas JSON do sistema nacional variam de caixa (``LoteDFe`` /
-``loteDfe`` etc.) entre ambientes — a leitura é tolerante a essas variações.
+* ``lote=true`` devolve o lote de documentos com NSU **maior** que o
+  informado (a rota é exclusiva); sem ele, ``/DFe/{NSU}`` devolve só o
+  documento daquele NSU exato.
+* ``cnpjConsulta`` (ou ``cpfConsulta``) é obrigatório desde 03/11/2026: sem
+  ele o ADN responde HTTP 400, ``StatusProcessamento: REJEICAO``,
+  ``TipoConsulta: InscricaoCertificado`` e ``Erros`` vazio. Com o CNPJ do
+  próprio certificado (ou da mesma raiz) a consulta é ``CnpjBase``; com outro
+  CNPJ, o ADN exige procuração eletrônica (senão ``E2245``).
+* O ADN responde 404 (nada encontrado) e 400 (rejeição) com o mesmo corpo
+  JSON das respostas normais: o que vale é ``StatusProcessamento``.
+* A resposta não informa o maior NSU disponível: o fim do feed é um lote
+  vazio, ``NENHUM_DOCUMENTO_LOCALIZADO`` ou HTTP 404.
+
+A API que gerava o DANFSe em PDF (``GET /danfse/{chave}``) foi desligada em
+03/08/2026 (NT 008/2026); o PDF agora é gerado localmente (``danfse.py``).
 """
 from __future__ import annotations
 
-import json
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -20,12 +30,20 @@ import httpx
 from . import config
 from .xml_nfse import decodificar_arquivo_xml
 
+# Respostas transitórias: vale esperar e repetir a mesma chamada.
+_TRANSITORIOS = {429, 500, 502, 503, 504}
+_TENTATIVAS = 4
+
 
 class AdnErro(Exception):
-    """Erro de comunicação ou de negócio devolvido pelas APIs nacionais."""
+    """Erro de comunicação ou de negócio devolvido pelo ADN."""
+
+    def __init__(self, mensagem: str, diagnostico: "Diagnostico | None" = None):
+        super().__init__(mensagem)
+        self.diagnostico = diagnostico
 
 
-def _get_ci(dicionario: dict, *nomes: str):
+def _get_ci(dicionario, *nomes: str):
     """Busca tolerante (case-insensitive) de uma chave no JSON."""
     if not isinstance(dicionario, dict):
         return None
@@ -37,58 +55,94 @@ def _get_ci(dicionario: dict, *nomes: str):
 
 
 @dataclass
+class Diagnostico:
+    """O que foi pedido e o que o ADN respondeu — exibido em "Testar conexão"."""
+
+    url: str = ""
+    http_status: int | None = None
+    tipo_consulta: str = ""
+    status_processamento: str = ""
+    tipo_ambiente: str = ""
+    versao_aplicativo: str = ""
+    data_hora: str = ""
+    erros: list[str] = field(default_factory=list)
+    alertas: list[str] = field(default_factory=list)
+    documentos_no_lote: int = 0
+
+    def como_dict(self) -> dict:
+        return {
+            "url": self.url,
+            "http_status": self.http_status,
+            "tipo_consulta": self.tipo_consulta,
+            "status_processamento": self.status_processamento,
+            "tipo_ambiente": self.tipo_ambiente,
+            "versao_aplicativo": self.versao_aplicativo,
+            "data_hora": self.data_hora,
+            "erros": self.erros,
+            "alertas": self.alertas,
+            "documentos_no_lote": self.documentos_no_lote,
+        }
+
+
+@dataclass
 class DocumentoDistribuido:
     nsu: int
     chave_acesso: str
     tipo_documento: str
     xml_bytes: bytes
-    dh_recebimento: str = ""
 
 
 @dataclass
 class RespostaDistribuicao:
     documentos: list[DocumentoDistribuido] = field(default_factory=list)
-    ult_nsu: int | None = None
-    max_nsu: int | None = None
     status: str = ""
+    maior_nsu: int | None = None    # maior NSU do lote, legível ou não
+    ilegiveis: list[str] = field(default_factory=list)
+    diagnostico: Diagnostico | None = None
 
     @property
-    def tem_mais(self) -> bool:
-        if not self.documentos:
-            return False
-        if self.max_nsu is not None:
-            maior = max(d.nsu for d in self.documentos if d.nsu is not None)
-            return maior < self.max_nsu
-        # Sem maxNSU informado: lote cheio sugere que há mais documentos.
-        return len(self.documentos) >= 50
+    def fim_do_feed(self) -> bool:
+        return self.maior_nsu is None
+
+
+def _mensagens(lista) -> list[str]:
+    """Erros/Alertas do ADN → ["E2245 – descrição – complemento", ...]."""
+    saida = []
+    for item in lista or []:
+        if isinstance(item, dict):
+            partes = [
+                _get_ci(item, "Codigo", "codigo"),
+                _get_ci(item, "Descricao", "descricao", "Mensagem", "mensagem"),
+                _get_ci(item, "Complemento", "complemento"),
+            ]
+            texto = " – ".join(str(p) for p in partes if p)
+        else:
+            texto = str(item)
+        if texto:
+            saida.append(texto)
+    return saida
+
+
+def tipo_do_documento(documento: str) -> str:
+    return "CPF" if len(documento or "") == 11 else "CNPJ"
 
 
 class AdnClient:
-    def __init__(self, ambiente: str, ssl_context,
-                 documento_consulta: str | None = None, tipo_documento: str = "CNPJ"):
+    def __init__(self, ambiente: str, ssl_context, documento_consulta: str):
+        if not documento_consulta:
+            raise ValueError("Informe o CNPJ/CPF a consultar.")
         self.base_adn = config.url_adn(ambiente)
-        self.base_sefin = config.url_sefin(ambiente)
         self.documento_consulta = documento_consulta
-        self.tipo_documento = tipo_documento
-        # Combinações de parâmetros da distribuição, da mais completa para a
-        # mais simples. Desde 03/11/2026 o ADN rejeita (HTTP 400 / REJEICAO,
-        # TipoConsulta "InscricaoCertificado") a consulta sem o CNPJ, que o
-        # manual do ADN já previa como parâmetro opcional. Quando o CNPJ
-        # informado é o do certificado, a consulta vira "CnpjBase".
-        # A lista permite seguir funcionando se o formato mudar de novo.
-        self._variantes: list[dict[str, str]] = []
-        if documento_consulta and tipo_documento == "CNPJ":
-            self._variantes.append({"cnpjConsulta": documento_consulta, "lote": "true"})
-            self._variantes.append({"cnpjConsulta": documento_consulta})
-        self._variantes.append({"lote": "true"})
-        self._variantes.append({})
-        self._variante_ok: int | None = None
+        self.param_consulta = (
+            "cpfConsulta" if tipo_do_documento(documento_consulta) == "CPF" else "cnpjConsulta"
+        )
+        self.ultimo_diagnostico: Diagnostico | None = None
         self._http = httpx.Client(
             verify=ssl_context,
             timeout=config.REQUEST_TIMEOUT,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "NFSeMonitor/1.0 (consulta de contribuinte)",
+                "User-Agent": "NFSeMonitor/1.1",
             },
         )
 
@@ -103,190 +157,153 @@ class AdnClient:
 
     # ------------------------------------------------------------------ #
 
-    def _erro_de_resposta(self, resp: httpx.Response) -> AdnErro:
-        detalhe = ""
-        corpo = None
-        try:
-            corpo = resp.json()
-            detalhe = (
-                _get_ci(corpo, "mensagem", "message", "erro", "descricao", "motivo")
-                or json.dumps(corpo, ensure_ascii=False)[:400]
-            )
-            if isinstance(detalhe, (list, dict)):
-                detalhe = json.dumps(detalhe, ensure_ascii=False)[:400]
-        except Exception:
-            detalhe = resp.text[:400]
-
-        # O ADN devolve os motivos em "Erros"/"Alertas"; quando vêm vazios,
-        # explica o cenário conhecido em vez de mostrar só o JSON cru.
-        if isinstance(corpo, dict):
-            listas = []
-            for campo in ("Erros", "Alertas"):
-                for item in (_get_ci(corpo, campo) or []):
-                    if isinstance(item, dict):
-                        texto = " ".join(str(v) for v in item.values() if v)
-                    else:
-                        texto = str(item)
-                    if texto:
-                        listas.append(texto)
-            status_proc = str(_get_ci(corpo, "StatusProcessamento") or "").upper()
-            tipo_consulta = str(_get_ci(corpo, "TipoConsulta") or "")
-            if listas:
-                detalhe = "; ".join(listas)
-            elif status_proc == "REJEICAO":
-                detalhe = (
-                    f"o ADN rejeitou a consulta sem detalhar o motivo (TipoConsulta: "
-                    f"{tipo_consulta or 'não informado'}). Causas conhecidas: o CNPJ da "
-                    "consulta não foi aceito; o certificado não é do CNPJ consultado "
-                    "(nem da mesma raiz) e não tem procuração para ele; ou o contribuinte "
-                    "ainda não está habilitado no Sistema Nacional NFS-e."
-                )
-
-        if resp.status_code in (401, 403, 496):
-            detalhe = (
-                "Acesso negado pelo servidor nacional. Verifique se o certificado "
-                f"digital é válido e corresponde ao CNPJ consultado. ({detalhe})"
-            )
-        return AdnErro(f"HTTP {resp.status_code} — {detalhe}")
-
-    def distribuir_dfe(self, ultimo_nsu: int) -> RespostaDistribuicao:
-        """Busca o próximo lote de documentos a partir do último NSU conhecido.
-
-        Tenta as combinações de parâmetros conhecidas até uma ser aceita e
-        memoriza a que funcionou, para não repetir tentativas nos próximos lotes.
-        """
-        url = f"{self.base_adn}/DFe/{int(ultimo_nsu)}"
-        ordem = list(range(len(self._variantes)))
-        if self._variante_ok is not None:
-            ordem.remove(self._variante_ok)
-            ordem.insert(0, self._variante_ok)
-
-        ultimo_erro: AdnErro | None = None
-        for indice in ordem:
-            params = self._variantes[indice]
+    def _get(self, url: str, params: dict) -> httpx.Response:
+        """GET com nova tentativa para 429/5xx e falhas de rede."""
+        espera = 2.0
+        ultimo_erro: Exception | None = None
+        for tentativa in range(_TENTATIVAS):
             try:
-                resp = self._http.get(url, params=params or None)
+                resp = self._http.get(url, params=params)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                texto = str(exc)
+                if "CERTIFICATE_VERIFY_FAILED" in texto:
+                    raise AdnErro(
+                        "Não foi possível validar o certificado do servidor adn.nfse.gov.br "
+                        f"({texto}). Isso costuma ser antivírus/firewall inspecionando HTTPS "
+                        "ou a cadeia ICP-Brasil ausente: salve a cadeia da AC em "
+                        "data/ca_extra.pem.") from exc
+                if any(p in texto.upper() for p in ("SSL", "TLS", "HANDSHAKE")):
+                    raise AdnErro(
+                        f"Falha no aperto de mão TLS com o ADN ({texto}). Confira se o "
+                        "certificado A1 é ICP-Brasil, está válido e se a senha está certa.") from exc
+                ultimo_erro = exc
             except httpx.HTTPError as exc:
                 raise AdnErro(f"Falha de conexão com o ADN: {exc}") from exc
+            else:
+                if resp.status_code not in _TRANSITORIOS or tentativa == _TENTATIVAS - 1:
+                    return resp
+                ultimo_erro = Exception(f"HTTP {resp.status_code}")
+                try:
+                    pedido = float(resp.headers.get("Retry-After", ""))
+                except ValueError:
+                    pedido = 0.0
+                if pedido > 60:
+                    raise AdnErro(
+                        f"HTTP {resp.status_code} — o ADN pediu para aguardar "
+                        f"{round(pedido / 60)} minuto(s) antes de nova consulta "
+                        "(consultas frequentes demais). Tente novamente depois.")
+                espera = max(espera, pedido)
+            if tentativa < _TENTATIVAS - 1:
+                time.sleep(espera)
+                espera = min(espera * 2, 30.0)
+        raise AdnErro(
+            f"Sem resposta do ADN após {_TENTATIVAS} tentativas: {ultimo_erro}. "
+            "Verifique a internet, firewall/antivírus (inspeção de HTTPS) e se o "
+            "servidor adn.nfse.gov.br está acessível."
+        )
 
-            if resp.status_code in (204, 404):
-                self._variante_ok = indice
-                return RespostaDistribuicao(status="sem_documentos")
-            if resp.status_code == 200:
-                self._variante_ok = indice
-                return self._interpretar_distribuicao(resp)
+    def distribuir_dfe(self, ultimo_nsu: int) -> RespostaDistribuicao:
+        """Lote de documentos com NSU maior que ``ultimo_nsu``."""
+        url = f"{self.base_adn}/DFe/{int(ultimo_nsu)}"
+        params = {"lote": "true", self.param_consulta: self.documento_consulta}
+        resp = self._get(url, params)
 
-            ultimo_erro = self._erro_de_resposta(resp)
-            # Só vale tentar outro formato de parâmetros quando a recusa é de
-            # requisição inválida; 401/403/5xx não mudam com outro parâmetro.
-            if resp.status_code != 400:
-                raise ultimo_erro
-        raise ultimo_erro or AdnErro("Falha desconhecida na distribuição de DF-e.")
-
-    def _interpretar_distribuicao(self, resp: httpx.Response) -> RespostaDistribuicao:
+        diag = Diagnostico(url=str(resp.request.url), http_status=resp.status_code)
+        self.ultimo_diagnostico = diag
         try:
             corpo = resp.json()
-        except json.JSONDecodeError as exc:
-            raise AdnErro(f"Resposta inesperada do ADN (não é JSON): {resp.text[:200]}") from exc
+        except ValueError:
+            corpo = None
 
-        resultado = RespostaDistribuicao()
-        resultado.status = str(_get_ci(corpo, "StatusProcessamento", "status") or "")
-        for campo, attr in (("ultNSU", "ult_nsu"), ("maxNSU", "max_nsu")):
-            valor = _get_ci(corpo, campo, campo.lower(), "maiorNSU" if campo == "maxNSU" else campo)
-            if valor is not None:
-                try:
-                    setattr(resultado, attr, int(valor))
-                except (TypeError, ValueError):
-                    pass
+        if isinstance(corpo, dict):
+            diag.tipo_consulta = str(_get_ci(corpo, "TipoConsulta") or "")
+            diag.status_processamento = str(_get_ci(corpo, "StatusProcessamento") or "").upper()
+            diag.tipo_ambiente = str(_get_ci(corpo, "TipoAmbiente") or "")
+            diag.versao_aplicativo = str(_get_ci(corpo, "VersaoAplicativo") or "")
+            diag.data_hora = str(_get_ci(corpo, "DataHoraProcessamento") or "")
+            diag.erros = _mensagens(_get_ci(corpo, "Erros"))
+            diag.alertas = _mensagens(_get_ci(corpo, "Alertas"))
 
-        lote = _get_ci(corpo, "LoteDFe", "loteDfe", "lote", "documentos") or []
+        if diag.status_processamento == "REJEICAO":
+            raise AdnErro(self._explicar_rejeicao(diag), diag)
+        if resp.status_code in (204, 404):
+            return RespostaDistribuicao(status="NENHUM_DOCUMENTO_LOCALIZADO", diagnostico=diag)
+        if resp.status_code in (401, 403, 495, 496):
+            raise AdnErro(
+                f"HTTP {resp.status_code} — o servidor nacional não aceitou o certificado "
+                "digital. Confira se está dentro da validade, se a senha está correta e se "
+                "é um certificado ICP-Brasil (e-CNPJ/e-CPF).", diag)
+        if resp.status_code != 200 or not isinstance(corpo, dict):
+            detalhe = "; ".join(diag.erros) or resp.text[:300]
+            raise AdnErro(f"HTTP {resp.status_code} — resposta inesperada do ADN: {detalhe}", diag)
+
+        return self._interpretar_lote(corpo, diag)
+
+    def _explicar_rejeicao(self, diag: Diagnostico) -> str:
+        base = f"HTTP {diag.http_status} — o ADN recusou a consulta (TipoConsulta: {diag.tipo_consulta or '?'})"
+        if diag.erros:
+            texto = f"{base}: {'; '.join(diag.erros)}"
+            if any(e.startswith("E2245") for e in diag.erros):
+                texto += (
+                    ". O certificado não tem procuração eletrônica para este CNPJ: a "
+                    "procuração precisa ter sido dada exatamente à inscrição do certificado "
+                    "(e-CNPJ do escritório ou e-CPF do contador) e incluir o serviço NFS-e."
+                )
+            return texto
+        if diag.tipo_consulta == "InscricaoCertificado":
+            return (
+                f"{base}, sem detalhar o motivo. Esse é o retorno de consulta sem o CNPJ "
+                f"consultado — o sistema enviou {self.param_consulta}={self.documento_consulta}, "
+                "então o ADN não reconheceu o parâmetro."
+            )
+        return (
+            f"{base}, sem detalhar o motivo. Causas conhecidas: certificado de outro CNPJ "
+            "(nem da mesma raiz) sem procuração; contribuinte não habilitado no Sistema "
+            "Nacional NFS-e; ou CNPJ consultado digitado errado."
+        )
+
+    @staticmethod
+    def _interpretar_lote(corpo: dict, diag: Diagnostico) -> RespostaDistribuicao:
+        resultado = RespostaDistribuicao(status=diag.status_processamento, diagnostico=diag)
+        lote = _get_ci(corpo, "LoteDFe", "loteDfe") or []
+        diag.documentos_no_lote = len(lote)
         for item in lote:
-            arquivo = _get_ci(item, "ArquivoXml", "arquivoXml", "XmlDocumento", "xml")
+            try:
+                nsu = int(_get_ci(item, "NSU", "nsu"))
+            except (TypeError, ValueError):
+                resultado.ilegiveis.append("item do lote sem NSU")
+                continue
+            resultado.maior_nsu = max(nsu, resultado.maior_nsu or 0)
+            arquivo = _get_ci(item, "ArquivoXml", "arquivoXml")
             if not arquivo:
+                resultado.ilegiveis.append(f"NSU {nsu}: sem conteúdo XML")
                 continue
             try:
                 xml_bytes = decodificar_arquivo_xml(arquivo)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — registra e segue o lote
+                resultado.ilegiveis.append(f"NSU {nsu}: XML ilegível ({exc})")
                 continue
-            nsu_raw = _get_ci(item, "NSU", "nsu")
-            try:
-                nsu = int(nsu_raw)
-            except (TypeError, ValueError):
-                nsu = 0
             resultado.documentos.append(
                 DocumentoDistribuido(
                     nsu=nsu,
-                    chave_acesso=str(_get_ci(item, "ChaveAcesso", "chaveAcesso", "chave") or ""),
-                    tipo_documento=str(_get_ci(item, "TipoDocumento", "tipoDocumento", "tipoDoc") or "").upper(),
+                    chave_acesso=str(_get_ci(item, "ChaveAcesso", "chaveAcesso") or ""),
+                    tipo_documento=str(_get_ci(item, "TipoDocumento", "tipoDocumento") or "").upper(),
                     xml_bytes=xml_bytes,
-                    dh_recebimento=str(_get_ci(item, "DataHoraRecebimento", "dhRecbto") or ""),
                 )
             )
-        if resultado.documentos and resultado.ult_nsu is None:
-            resultado.ult_nsu = max(d.nsu for d in resultado.documentos)
         return resultado
 
-    def consultar_eventos(self, chave_acesso: str) -> list[bytes]:
-        """Eventos vinculados a uma chave de acesso (lista de XMLs)."""
-        url = f"{self.base_adn}/NFSe/{chave_acesso}/Eventos"
+    def testar_conexao(self) -> dict:
+        """Chamada real de distribuição a partir do NSU 0, com o diagnóstico."""
         try:
-            resp = self._http.get(url)
-        except httpx.HTTPError as exc:
-            raise AdnErro(f"Falha de conexão com o ADN: {exc}") from exc
-        if resp.status_code in (204, 404):
-            return []
-        if resp.status_code != 200:
-            raise self._erro_de_resposta(resp)
-        corpo = resp.json()
-        lote = _get_ci(corpo, "LoteDFe", "loteDfe", "eventos", "documentos") or []
-        xmls = []
-        for item in lote:
-            arquivo = _get_ci(item, "ArquivoXml", "arquivoXml", "xml") if isinstance(item, dict) else item
-            if arquivo:
-                try:
-                    xmls.append(decodificar_arquivo_xml(arquivo))
-                except Exception:
-                    continue
-        return xmls
-
-    def baixar_danfse(self, chave_acesso: str) -> bytes:
-        """Baixa o PDF (DANFSe) da nota; tenta SEFIN Nacional e depois o ADN."""
-        erros = []
-        for url in (
-            f"{self.base_sefin}/danfse/{chave_acesso}",
-            f"{self.base_adn.rsplit('/contribuintes', 1)[0]}/danfse/{chave_acesso}",
-        ):
-            try:
-                resp = self._http.get(url, headers={"Accept": "application/pdf, application/json"})
-            except httpx.HTTPError as exc:
-                erros.append(f"{url}: {exc}")
-                continue
-            if resp.status_code == 200:
-                conteudo = resp.content
-                if conteudo[:4] == b"%PDF":
-                    return conteudo
-                # Alguns retornos embrulham o PDF em JSON base64
-                try:
-                    corpo = resp.json()
-                    b64 = _get_ci(corpo, "pdf", "arquivoPdf", "danfse", "documento")
-                    if b64:
-                        import base64 as _b64
-                        pdf = _b64.b64decode(b64)
-                        if pdf[:4] == b"%PDF":
-                            return pdf
-                except Exception:
-                    pass
-                erros.append(f"{url}: resposta não é PDF")
-            else:
-                erros.append(f"{url}: HTTP {resp.status_code}")
-        raise AdnErro("Não foi possível obter o DANFSe. " + " | ".join(erros))
-
-    def testar_conexao(self, ultimo_nsu: int = 0) -> str:
-        """Faz uma chamada real de distribuição só para validar o mTLS."""
-        resposta = self.distribuir_dfe(ultimo_nsu)
-        if resposta.status == "sem_documentos":
-            return "Conexão OK — nenhum documento disponível para este CNPJ no momento."
-        return (
-            f"Conexão OK — {len(resposta.documentos)} documento(s) no primeiro lote"
-            + (f", maior NSU disponível: {resposta.max_nsu}." if resposta.max_nsu else ".")
-        )
+            resposta = self.distribuir_dfe(0)
+        except AdnErro as exc:
+            return {"ok": False, "mensagem": str(exc),
+                    "diagnostico": exc.diagnostico.como_dict() if exc.diagnostico else None}
+        diag = resposta.diagnostico
+        if resposta.fim_do_feed:
+            mensagem = "Conexão OK — o ADN respondeu, mas não há documentos para este CNPJ."
+        else:
+            mensagem = (f"Conexão OK — {diag.documentos_no_lote} documento(s) no primeiro lote "
+                        f"(TipoConsulta: {diag.tipo_consulta or '?'}).")
+        return {"ok": True, "mensagem": mensagem, "diagnostico": diag.como_dict()}

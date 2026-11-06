@@ -50,6 +50,7 @@
           <span id="empresa-cnpj" class="meta-item"></span>
           <span id="empresa-ambiente" class="badge"></span>
           <span id="empresa-cert" class="badge"></span>
+          <span id="empresa-procuracao" class="badge oculto"></span>
         </div>
       </div>
       <div class="painel-acoes">
@@ -155,6 +156,12 @@
       <label>Senha do certificado
         <input type="password" name="senha" autocomplete="off" placeholder="••••••••">
       </label>
+      <label id="campo-cnpj-consulta">CNPJ a consultar <small>(opcional)</small>
+        <input type="text" name="cnpj_consulta" inputmode="numeric" maxlength="18"
+               placeholder="Em branco = CNPJ do próprio certificado">
+        <small>Preencha só para consultar outra empresa que deu <strong>procuração eletrônica</strong>
+          ao titular deste certificado (ex.: cliente usando o e-CNPJ do escritório).</small>
+      </label>
       <label>Ambiente
         <select name="ambiente">
           <option value="producao">Produção (notas reais)</option>
@@ -179,6 +186,21 @@
     <div class="modal-acoes">
       <button class="btn" onclick="fecharModais()">Cancelar</button>
       <button class="btn btn-perigo" onclick="excluirEmpresa()">Excluir</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal diagnóstico da conexão -->
+<div class="modal-fundo oculto" id="modal-diagnostico">
+  <div class="modal modal-larga">
+    <h2 id="diag-titulo">Teste de conexão com o ADN</h2>
+    <div id="diag-resumo" class="diag-resumo"></div>
+    <dl class="detalhe-grid" id="diag-campos"></dl>
+    <p class="aviso">Se precisar de ajuda, copie o diagnóstico e envie para o suporte —
+      ele não contém senha nem dados do certificado.</p>
+    <div class="modal-acoes">
+      <button class="btn" onclick="copiarDiagnostico()">📋 Copiar diagnóstico</button>
+      <button class="btn btn-primario" onclick="fecharModais()">Fechar</button>
     </div>
   </div>
 </div>

@@ -52,26 +52,40 @@ def _documento_pessoa(el: ET.Element | None) -> str:
     return ""
 
 
+_BOM = b"\xef\xbb\xbf"
+
+
 def decodificar_arquivo_xml(conteudo: str | bytes) -> bytes:
     """Decodifica o campo ArquivoXml da distribuição (Base64 de XML gzipado).
 
-    Tolera três formatos observados nas APIs nacionais: gzip+base64,
-    zlib/deflate+base64 e XML puro em base64 (ou já em texto).
+    Aceita base64 padrão ou "URL-safe" (``-``/``_``), com ou sem quebras de
+    linha e padding, e conteúdo gzip, zlib/deflate ou XML puro. Levanta
+    ``ValueError`` se o resultado não for XML — nunca devolve lixo calado.
     """
-    if isinstance(conteudo, str):
-        conteudo = conteudo.strip().encode("ascii", "ignore")
-    if conteudo.lstrip().startswith(b"<"):
-        return conteudo
-    bruto = base64.b64decode(conteudo, validate=False)
+    if isinstance(conteudo, bytes):
+        if conteudo.lstrip().startswith((b"<", _BOM)):
+            return conteudo.lstrip().removeprefix(_BOM)
+        conteudo = conteudo.decode("ascii", "ignore")
+    texto = conteudo.strip()
+    if texto.startswith("<"):
+        return texto.encode("utf-8")
+
+    normal = re.sub(r"\s+", "", texto).replace("-", "+").replace("_", "/")
+    normal += "=" * (-len(normal) % 4)
+    bruto = base64.b64decode(normal, validate=True)
+
     if bruto[:2] == b"\x1f\x8b":
-        return gzip.decompress(bruto)
-    if bruto.lstrip().startswith(b"<"):
-        return bruto
-    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS, zlib.MAX_WBITS | 16):
-        try:
-            return zlib.decompress(bruto, wbits)
-        except zlib.error:
-            continue
+        bruto = gzip.decompress(bruto)
+    elif not bruto.lstrip().startswith((b"<", _BOM)):
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                bruto = zlib.decompress(bruto, wbits)
+                break
+            except zlib.error:
+                continue
+    bruto = bruto.lstrip().removeprefix(_BOM)
+    if not bruto.startswith(b"<"):
+        raise ValueError("o conteúdo decodificado não é XML")
     return bruto
 
 
@@ -178,7 +192,35 @@ def parse_nfse(xml_bytes: bytes) -> NotaExtraida:
 _RE_TIPO_EVENTO = re.compile(r"^e(\d{6})$")
 
 # Palavras que descaracterizam um cancelamento efetivo
-_NAO_CANCELA = ("indeferido", "bloqueio", "desbloqueio", "anula")
+# Eventos do leiaute nacional que tiram a nota de circulação.
+EVENTOS_CANCELAMENTO = {
+    "101101",  # Cancelamento de NFS-e
+    "105104",  # Cancelamento de NFS-e Deferido por Análise Fiscal
+    "305101",  # Cancelamento de NFS-e por Ofício
+}
+EVENTOS_SUBSTITUICAO = {"105102"}  # Cancelamento de NFS-e por Substituição
+# Eventos que mencionam "cancelamento" sem cancelar: 101103 (Solicitação de
+# Análise Fiscal para Cancelamento), 105105 (Indeferido), 305102/305103
+# (Bloqueio/Desbloqueio por Ofício).
+_NAO_CANCELA = ("indeferid", "bloqueio", "desbloqueio", "anula", "solicita")
+
+
+def situacao_por_evento(tipo_evento: str, descricao: str) -> str | None:
+    """'CANCELADA', 'SUBSTITUIDA' ou None (evento não muda a situação).
+
+    Decide pelo código do evento; a descrição só é usada quando o código
+    não veio no XML.
+    """
+    if tipo_evento in EVENTOS_SUBSTITUICAO:
+        return "SUBSTITUIDA"
+    if tipo_evento in EVENTOS_CANCELAMENTO:
+        return "CANCELADA"
+    if tipo_evento:
+        return None
+    desc = (descricao or "").lower()
+    if "cancelamento" not in desc or any(p in desc for p in _NAO_CANCELA):
+        return None
+    return "SUBSTITUIDA" if "substitui" in desc else "CANCELADA"
 
 
 def parse_evento(xml_bytes: bytes) -> EventoExtraido:
@@ -198,14 +240,7 @@ def parse_evento(xml_bytes: bytes) -> EventoExtraido:
         descricao = _texto(raiz, "xDesc") or _texto(raiz, "xDescEv")
     ev.descricao = descricao
 
-    desc_lower = descricao.lower()
-    eh_cancelamento = "cancelamento" in desc_lower or ev.tipo_evento in (
-        "101101",  # Cancelamento de NFS-e
-        "105102",  # Cancelamento por substituição
-        "305102",  # Cancelamento por ofício
-    )
-    if eh_cancelamento and not any(p in desc_lower for p in _NAO_CANCELA):
-        ev.cancela_nota = True
-        if "substitui" in desc_lower or ev.tipo_evento == "105102":
-            ev.substitui_nota = True
+    situacao = situacao_por_evento(ev.tipo_evento, descricao)
+    ev.cancela_nota = situacao is not None
+    ev.substitui_nota = situacao == "SUBSTITUIDA"
     return ev

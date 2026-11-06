@@ -9,7 +9,7 @@ import time
 from . import config, db, security
 from .adn_client import AdnClient, AdnErro
 from .certificado import criar_ssl_context
-from .xml_nfse import parse_evento, parse_nfse, tipo_documento
+from .xml_nfse import parse_evento, parse_nfse, situacao_por_evento, tipo_documento
 
 
 def _agora() -> str:
@@ -41,7 +41,6 @@ class SyncManager:
                 "docs_novos": 0,
                 "eventos_novos": 0,
                 "nsu_atual": None,
-                "max_nsu": None,
                 "iniciado_em": _agora(),
             }
         threading.Thread(target=self._executar, args=(empresa_id,), daemon=True).start()
@@ -68,12 +67,12 @@ class SyncManager:
 
             docs_novos = 0
             eventos_novos = 0
+            ilegiveis: list[str] = []
             ultimo_nsu = int(empresa["ultimo_nsu"] or 0)
-            max_nsu_conhecido = None
 
-            with AdnClient(empresa["ambiente"], ctx,
-                           documento_consulta=empresa["cnpj"],
-                           tipo_documento=empresa["tipo_documento"]) as cliente:
+            # A resposta do ADN não informa o maior NSU disponível: lê lote após
+            # lote até vir um lote vazio / NENHUM_DOCUMENTO_LOCALIZADO / 404.
+            with AdnClient(empresa["ambiente"], ctx, documento_consulta=empresa["cnpj"]) as cliente:
                 while True:
                     self._atualizar(
                         empresa_id,
@@ -81,27 +80,23 @@ class SyncManager:
                         nsu_atual=ultimo_nsu,
                     )
                     resposta = cliente.distribuir_dfe(ultimo_nsu)
-                    if resposta.max_nsu is not None:
-                        max_nsu_conhecido = resposta.max_nsu
-                        self._atualizar(empresa_id, max_nsu=resposta.max_nsu)
-                    if not resposta.documentos:
+                    ilegiveis += resposta.ilegiveis
+                    if resposta.fim_do_feed:
                         break
 
-                    n_docs, n_evts = self._processar_lote(empresa_id, empresa, resposta.documentos)
+                    n_docs, n_evts, falhas = self._processar_lote(
+                        empresa_id, empresa, resposta.documentos)
                     docs_novos += n_docs
                     eventos_novos += n_evts
+                    ilegiveis += falhas
 
-                    maior_nsu = max(d.nsu for d in resposta.documentos)
-                    if resposta.ult_nsu is not None:
-                        maior_nsu = max(maior_nsu, resposta.ult_nsu)
-                    if maior_nsu <= ultimo_nsu:
+                    if resposta.maior_nsu <= ultimo_nsu:
                         break  # proteção contra loop sem avanço
-                    ultimo_nsu = maior_nsu
-
+                    ultimo_nsu = resposta.maior_nsu
                     with db.conexao() as con:
                         con.execute(
                             "UPDATE empresas SET ultimo_nsu = ?, max_nsu = ? WHERE id = ?",
-                            (ultimo_nsu, max_nsu_conhecido or ultimo_nsu, empresa_id),
+                            (ultimo_nsu, ultimo_nsu, empresa_id),
                         )
                     self._atualizar(
                         empresa_id,
@@ -109,8 +104,6 @@ class SyncManager:
                         eventos_novos=eventos_novos,
                         nsu_atual=ultimo_nsu,
                     )
-                    if not resposta.tem_mais:
-                        break
                     time.sleep(config.PAUSA_ENTRE_LOTES)
 
             self._aplicar_eventos(empresa_id)
@@ -118,15 +111,24 @@ class SyncManager:
             with db.conexao() as con:
                 con.execute(
                     "UPDATE empresas SET ultimo_nsu = ?, max_nsu = ?, ultima_sync = ? WHERE id = ?",
-                    (ultimo_nsu, max_nsu_conhecido or ultimo_nsu, _agora(), empresa_id),
+                    (ultimo_nsu, ultimo_nsu, _agora(), empresa_id),
+                )
+            proxima = (dt.datetime.now() + dt.timedelta(seconds=config.INTERVALO_MINIMO_SYNC))
+            mensagem = (
+                f"Sincronização concluída: {docs_novos} nota(s) e {eventos_novos} evento(s) "
+                f"novos. Último NSU: {ultimo_nsu}. O ADN pede 1 hora de intervalo quando não "
+                f"há documentos novos — próxima consulta a partir de {proxima:%H:%M}."
+            )
+            if ilegiveis:
+                mensagem += (
+                    f" Atenção: {len(ilegiveis)} documento(s) não puderam ser lidos — "
+                    + "; ".join(ilegiveis[:3]) + ("..." if len(ilegiveis) > 3 else "")
                 )
             self._atualizar(
                 empresa_id,
                 estado="concluido",
-                mensagem=(
-                    f"Sincronização concluída: {docs_novos} nota(s) e {eventos_novos} "
-                    f"evento(s) novos. Último NSU: {ultimo_nsu}."
-                ),
+                mensagem=mensagem,
+                ilegiveis=ilegiveis,
                 finalizado_em=_agora(),
             )
         except AdnErro as exc:
@@ -141,24 +143,22 @@ class SyncManager:
 
     # ------------------------------------------------------------------ #
 
-    def _processar_lote(self, empresa_id: int, empresa, documentos) -> tuple[int, int]:
-        docs, evts = 0, 0
+    def _processar_lote(self, empresa_id: int, empresa, documentos) -> tuple[int, int, list[str]]:
+        docs, evts, falhas = 0, 0, []
         cnpj_empresa = empresa["cnpj"]
         with db.conexao() as con:
             for doc in documentos:
                 tipo = doc.tipo_documento or ""
-                if tipo not in ("NFSE", "EVENTO"):
-                    try:
+                try:
+                    if tipo not in ("NFSE", "EVENTO"):
                         tipo = tipo_documento(doc.xml_bytes)
-                    except Exception:
-                        continue
-                if tipo == "NFSE":
-                    if self._gravar_nota(con, empresa_id, cnpj_empresa, doc):
-                        docs += 1
-                elif tipo == "EVENTO":
-                    if self._gravar_evento(con, empresa_id, doc):
-                        evts += 1
-        return docs, evts
+                    if tipo == "NFSE":
+                        docs += self._gravar_nota(con, empresa_id, cnpj_empresa, doc)
+                    elif tipo == "EVENTO":
+                        evts += self._gravar_evento(con, empresa_id, doc)
+                except Exception as exc:  # noqa: BLE001 — registra e segue o lote
+                    falhas.append(f"NSU {doc.nsu}: {exc}")
+        return docs, evts, falhas
 
     @staticmethod
     def _classificar_papel(cnpj_empresa: str, nota) -> str:
@@ -180,13 +180,10 @@ class SyncManager:
         return "recebida"
 
     def _gravar_nota(self, con, empresa_id: int, cnpj_empresa: str, doc) -> bool:
-        try:
-            nota = parse_nfse(doc.xml_bytes)
-        except Exception:
-            return False
+        nota = parse_nfse(doc.xml_bytes)
         chave = nota.chave_acesso or doc.chave_acesso
         if not chave:
-            return False
+            raise ValueError("NFS-e sem chave de acesso")
         papel = self._classificar_papel(cnpj_empresa, nota)
         cursor = con.execute(
             """
@@ -199,6 +196,7 @@ class SyncManager:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ATIVA', ?)
             ON CONFLICT (empresa_id, chave_acesso) DO UPDATE SET
                 nsu = excluded.nsu,
+                papel = excluded.papel,
                 numero = excluded.numero,
                 data_emissao = excluded.data_emissao,
                 dh_emissao = excluded.dh_emissao,
@@ -219,13 +217,10 @@ class SyncManager:
 
     @staticmethod
     def _gravar_evento(con, empresa_id: int, doc) -> bool:
-        try:
-            evento = parse_evento(doc.xml_bytes)
-        except Exception:
-            return False
+        evento = parse_evento(doc.xml_bytes)
         chave = evento.chave_acesso or doc.chave_acesso
         if not chave:
-            return False
+            raise ValueError("evento sem chave da NFS-e")
         cursor = con.execute(
             """
             INSERT OR IGNORE INTO eventos (
@@ -241,21 +236,23 @@ class SyncManager:
 
     @staticmethod
     def _aplicar_eventos(empresa_id: int) -> None:
-        """Recalcula a situação das notas com base nos eventos recebidos."""
+        """Recalcula a situação de todas as notas a partir dos eventos.
+
+        Recalcula do zero (todas ATIVA, depois aplica os eventos) para que
+        uma correção na regra também conserte notas marcadas antes.
+        """
         with db.conexao() as con:
             linhas = con.execute(
                 "SELECT chave_acesso, tipo_evento, descricao FROM eventos WHERE empresa_id = ?",
                 (empresa_id,),
             ).fetchall()
-            canceladas: dict[str, str] = {}
+            situacoes: dict[str, str] = {}
             for linha in linhas:
-                desc = (linha["descricao"] or "").lower()
-                tipo = linha["tipo_evento"] or ""
-                cancela = ("cancelamento" in desc or tipo in ("101101", "105102", "305102"))
-                if cancela and not any(p in desc for p in ("indeferido", "bloqueio", "desbloqueio", "anula")):
-                    situacao = "SUBSTITUIDA" if ("substitui" in desc or tipo == "105102") else "CANCELADA"
-                    canceladas[linha["chave_acesso"]] = situacao
-            for chave, situacao in canceladas.items():
+                situacao = situacao_por_evento(linha["tipo_evento"] or "", linha["descricao"] or "")
+                if situacao and situacoes.get(linha["chave_acesso"]) != "SUBSTITUIDA":
+                    situacoes[linha["chave_acesso"]] = situacao
+            con.execute("UPDATE notas SET situacao = 'ATIVA' WHERE empresa_id = ?", (empresa_id,))
+            for chave, situacao in situacoes.items():
                 con.execute(
                     "UPDATE notas SET situacao = ? WHERE empresa_id = ? AND chave_acesso = ?",
                     (situacao, empresa_id, chave),

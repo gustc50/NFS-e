@@ -289,6 +289,16 @@ tbody tr:hover { background: #f7f9fd; cursor: pointer; }
 .detalhe-acoes { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .evento-item { border-left: 3px solid var(--laranja); padding: 4px 10px; margin: 6px 0; background: #fffaf0; border-radius: 4px; font-size: 12.5px; }
 
+/* diagnóstico */
+.diag-resumo { border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px; line-height: 1.45; }
+.diag-resumo.ok { background: var(--verde-claro); color: var(--verde); }
+.diag-resumo.erro { background: var(--vermelho-claro); color: var(--vermelho); }
+#diag-campos { grid-template-columns: 170px 1fr; gap: 2px 14px; align-items: baseline; }
+#diag-campos dt { margin: 0; padding-top: 3px; }
+#diag-campos dd { margin: 0 0 4px; }
+#diag-campos dd code { font-size: 12px; word-break: break-all; white-space: pre-wrap; }
+#modal-empresa label small strong { color: var(--texto); }
+
 /* toast */
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
