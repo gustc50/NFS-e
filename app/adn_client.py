@@ -64,10 +64,25 @@ class RespostaDistribuicao:
 
 
 class AdnClient:
-    def __init__(self, ambiente: str, ssl_context, cnpj_consulta: str | None = None):
+    def __init__(self, ambiente: str, ssl_context,
+                 documento_consulta: str | None = None, tipo_documento: str = "CNPJ"):
         self.base_adn = config.url_adn(ambiente)
         self.base_sefin = config.url_sefin(ambiente)
-        self.cnpj_consulta = cnpj_consulta
+        self.documento_consulta = documento_consulta
+        self.tipo_documento = tipo_documento
+        # Combinações de parâmetros da distribuição, da mais completa para a
+        # mais simples. Desde 03/11/2026 o ADN rejeita (HTTP 400 / REJEICAO,
+        # TipoConsulta "InscricaoCertificado") a consulta sem o CNPJ, que o
+        # manual do ADN já previa como parâmetro opcional. Quando o CNPJ
+        # informado é o do certificado, a consulta vira "CnpjBase".
+        # A lista permite seguir funcionando se o formato mudar de novo.
+        self._variantes: list[dict[str, str]] = []
+        if documento_consulta and tipo_documento == "CNPJ":
+            self._variantes.append({"cnpjConsulta": documento_consulta, "lote": "true"})
+            self._variantes.append({"cnpjConsulta": documento_consulta})
+        self._variantes.append({"lote": "true"})
+        self._variantes.append({})
+        self._variante_ok: int | None = None
         self._http = httpx.Client(
             verify=ssl_context,
             timeout=config.REQUEST_TIMEOUT,
@@ -90,6 +105,7 @@ class AdnClient:
 
     def _erro_de_resposta(self, resp: httpx.Response) -> AdnErro:
         detalhe = ""
+        corpo = None
         try:
             corpo = resp.json()
             detalhe = (
@@ -100,7 +116,33 @@ class AdnClient:
                 detalhe = json.dumps(detalhe, ensure_ascii=False)[:400]
         except Exception:
             detalhe = resp.text[:400]
-        if resp.status_code == 401 or resp.status_code == 403 or resp.status_code == 496:
+
+        # O ADN devolve os motivos em "Erros"/"Alertas"; quando vêm vazios,
+        # explica o cenário conhecido em vez de mostrar só o JSON cru.
+        if isinstance(corpo, dict):
+            listas = []
+            for campo in ("Erros", "Alertas"):
+                for item in (_get_ci(corpo, campo) or []):
+                    if isinstance(item, dict):
+                        texto = " ".join(str(v) for v in item.values() if v)
+                    else:
+                        texto = str(item)
+                    if texto:
+                        listas.append(texto)
+            status_proc = str(_get_ci(corpo, "StatusProcessamento") or "").upper()
+            tipo_consulta = str(_get_ci(corpo, "TipoConsulta") or "")
+            if listas:
+                detalhe = "; ".join(listas)
+            elif status_proc == "REJEICAO":
+                detalhe = (
+                    f"o ADN rejeitou a consulta sem detalhar o motivo (TipoConsulta: "
+                    f"{tipo_consulta or 'não informado'}). Causas conhecidas: o CNPJ da "
+                    "consulta não foi aceito; o certificado não é do CNPJ consultado "
+                    "(nem da mesma raiz) e não tem procuração para ele; ou o contribuinte "
+                    "ainda não está habilitado no Sistema Nacional NFS-e."
+                )
+
+        if resp.status_code in (401, 403, 496):
             detalhe = (
                 "Acesso negado pelo servidor nacional. Verifique se o certificado "
                 f"digital é válido e corresponde ao CNPJ consultado. ({detalhe})"
@@ -108,21 +150,40 @@ class AdnClient:
         return AdnErro(f"HTTP {resp.status_code} — {detalhe}")
 
     def distribuir_dfe(self, ultimo_nsu: int) -> RespostaDistribuicao:
-        """Busca o próximo lote de documentos a partir do último NSU conhecido."""
+        """Busca o próximo lote de documentos a partir do último NSU conhecido.
+
+        Tenta as combinações de parâmetros conhecidas até uma ser aceita e
+        memoriza a que funcionou, para não repetir tentativas nos próximos lotes.
+        """
         url = f"{self.base_adn}/DFe/{int(ultimo_nsu)}"
-        params = {}
-        if self.cnpj_consulta:
-            params["cnpjConsulta"] = self.cnpj_consulta
-        try:
-            resp = self._http.get(url, params=params or None)
-        except httpx.HTTPError as exc:
-            raise AdnErro(f"Falha de conexão com o ADN: {exc}") from exc
+        ordem = list(range(len(self._variantes)))
+        if self._variante_ok is not None:
+            ordem.remove(self._variante_ok)
+            ordem.insert(0, self._variante_ok)
 
-        if resp.status_code in (204, 404):
-            return RespostaDistribuicao(status="sem_documentos")
-        if resp.status_code != 200:
-            raise self._erro_de_resposta(resp)
+        ultimo_erro: AdnErro | None = None
+        for indice in ordem:
+            params = self._variantes[indice]
+            try:
+                resp = self._http.get(url, params=params or None)
+            except httpx.HTTPError as exc:
+                raise AdnErro(f"Falha de conexão com o ADN: {exc}") from exc
 
+            if resp.status_code in (204, 404):
+                self._variante_ok = indice
+                return RespostaDistribuicao(status="sem_documentos")
+            if resp.status_code == 200:
+                self._variante_ok = indice
+                return self._interpretar_distribuicao(resp)
+
+            ultimo_erro = self._erro_de_resposta(resp)
+            # Só vale tentar outro formato de parâmetros quando a recusa é de
+            # requisição inválida; 401/403/5xx não mudam com outro parâmetro.
+            if resp.status_code != 400:
+                raise ultimo_erro
+        raise ultimo_erro or AdnErro("Falha desconhecida na distribuição de DF-e.")
+
+    def _interpretar_distribuicao(self, resp: httpx.Response) -> RespostaDistribuicao:
         try:
             corpo = resp.json()
         except json.JSONDecodeError as exc:

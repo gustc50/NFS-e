@@ -96,7 +96,7 @@ python run.py --port 9000 --no-browser   # opções
 
 | Operação | Endpoint |
 |---|---|
-| Distribuição de DF-e por NSU | `GET https://adn.nfse.gov.br/contribuintes/DFe/{ultimoNSU}` |
+| Distribuição de DF-e por NSU | `GET https://adn.nfse.gov.br/contribuintes/DFe/{ultimoNSU}?cnpjConsulta={CNPJ}&lote=true` |
 | Eventos por chave de acesso | `GET https://adn.nfse.gov.br/contribuintes/NFSe/{chave}/Eventos` |
 | DANFSe (PDF) | `GET https://sefin.nfse.gov.br/sefinnacional/danfse/{chave}` |
 
@@ -108,6 +108,32 @@ nacional (namespace `http://www.sped.fazenda.gov.br/nfse`).
 
 Documentação oficial: [APIs Prod. Restrita e Produção](https://www.gov.br/nfse/pt-br/biblioteca/documentacao-tecnica/apis-prod-restrita-e-producao) ·
 [Manual do contribuinte — APIs do ADN](https://www.gov.br/nfse/pt-br/biblioteca/documentacao-tecnica/documentacao-atual/manual-contribuintes-apis-adn-sistema-nacional-nfse.pdf)
+
+## Solução de problemas
+
+**HTTP 400 — `"StatusProcessamento": "REJEICAO"`, `"TipoConsulta": "InscricaoCertificado"`, `Erros` vazio**
+
+Desde **03/11/2026** o ADN passou a exigir o CNPJ na consulta de distribuição:
+chamar `GET /contribuintes/DFe/{NSU}` sem o parâmetro `cnpjConsulta` devolve
+esse 400. O sistema já envia `?cnpjConsulta={CNPJ}&lote=true` — se o erro
+voltar a aparecer, atualize para a versão mais recente deste repositório.
+
+Se o erro persistir **com** o parâmetro, o motivo costuma ser de habilitação,
+não de código:
+
+- o certificado precisa ser o do CNPJ consultado ou de outro com a **mesma
+  raiz de CNPJ** (os 8 primeiros dígitos);
+- para consultar o CNPJ de um cliente (escritório contábil), é preciso
+  **procuração eletrônica** concedida exatamente à inscrição do certificado
+  (e-CNPJ do escritório ou e-CPF do contador);
+- o contribuinte precisa estar habilitado no Sistema Nacional NFS-e.
+
+**HTTP 401 / 403 / 496** — problema no certificado: vencido, senha errada,
+não é ICP-Brasil, ou a cadeia da AC não é reconhecida (nesse caso, salve a
+cadeia em `data/ca_extra.pem`).
+
+**HTTP 429 ou 5xx** — ADN indisponível ou consultas frequentes demais.
+Respeite o intervalo de 1 hora quando não houver documentos novos.
 
 ## Limitações importantes
 

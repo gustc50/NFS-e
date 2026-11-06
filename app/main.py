@@ -374,7 +374,9 @@ def _criar_cliente(empresa) -> AdnClient:
     pfx_bytes = (config.CERT_DIR / empresa["cert_arquivo"]).read_bytes()
     senha = security.descriptografar(empresa["senha_cripto"])
     ctx = criar_ssl_context(pfx_bytes, senha)
-    return AdnClient(empresa["ambiente"], ctx)
+    return AdnClient(empresa["ambiente"], ctx,
+                     documento_consulta=empresa["cnpj"],
+                     tipo_documento=empresa["tipo_documento"])
 
 
 def _obter_danfse_bytes(empresa, chave: str, cliente: AdnClient | None = None) -> bytes:

@@ -71,7 +71,9 @@ class SyncManager:
             ultimo_nsu = int(empresa["ultimo_nsu"] or 0)
             max_nsu_conhecido = None
 
-            with AdnClient(empresa["ambiente"], ctx, cnpj_consulta=None) as cliente:
+            with AdnClient(empresa["ambiente"], ctx,
+                           documento_consulta=empresa["cnpj"],
+                           tipo_documento=empresa["tipo_documento"]) as cliente:
                 while True:
                     self._atualizar(
                         empresa_id,

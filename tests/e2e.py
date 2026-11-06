@@ -109,6 +109,28 @@ def main() -> int:
         assert st["docs_novos"] == 11 and st["eventos_novos"] == 2, st
         print("✔ sincronização por NSU (11 notas + 2 eventos)")
 
+        # regressão: desde 03/11/2026 o ADN exige cnpjConsulta na distribuição
+        os.environ["NFSE_DATA_DIR"] = str(dados)
+        os.environ["NFSE_ADN_BASE"] = f"https://localhost:{porta_mock}"
+        os.environ["NFSE_SEFIN_BASE"] = f"https://localhost:{porta_mock}"
+        sys.path.insert(0, str(RAIZ))
+        from app.adn_client import AdnClient, AdnErro
+        from app.certificado import criar_ssl_context
+
+        pfx = (certs / "empresa1.pfx").read_bytes()
+        with AdnClient("producao", criar_ssl_context(pfx, "senha123")) as sem_cnpj:
+            try:
+                sem_cnpj.distribuir_dfe(0)
+                raise AssertionError("o ADN deveria rejeitar a consulta sem cnpjConsulta")
+            except AdnErro as exc:
+                assert "InscricaoCertificado" in str(exc), exc
+                assert "rejeitou" in str(exc), exc  # mensagem explicativa, não JSON cru
+        with AdnClient("producao", criar_ssl_context(pfx, "senha123"),
+                       documento_consulta="11222333000181") as com_cnpj:
+            resposta = com_cnpj.distribuir_dfe(0)
+            assert resposta.documentos, "com cnpjConsulta a distribuição deve responder"
+        print("✔ distribuição envia cnpjConsulta (regressão do HTTP 400 / REJEICAO)")
+
         # período julho
         _, jul = req("GET", f"{base}/api/empresas/{eid}/notas?inicio=2026-07-01&fim=2026-07-31")
         assert len(jul["emitidas"]) == 3 and len(jul["recebidas"]) == 2, jul["totais"]

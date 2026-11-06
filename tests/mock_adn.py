@@ -13,6 +13,7 @@ import ssl
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 CERT_DIR = Path(sys.argv[1])
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9443
@@ -178,24 +179,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(dados)
 
     def do_GET(self):
-        m = re.match(r"^/DFe/(\d+)$", self.path.split("?")[0])
+        caminho = urlparse(self.path)
+        query = parse_qs(caminho.query)
+        m = re.match(r"^/DFe/(\d+)$", caminho.path)
         if m:
             nsu = int(m.group(1))
+            cnpj_cert = self._cnpj_cliente()
+            cnpj_consulta = (query.get("cnpjConsulta") or [""])[0]
+            # Desde 03/11/2026 o ADN exige o CNPJ da consulta; sem ele a
+            # resposta é HTTP 400 / REJEICAO com TipoConsulta
+            # "InscricaoCertificado" e a lista de erros vazia.
+            if not cnpj_consulta:
+                return self._json(400, {
+                    "TipoConsulta": "InscricaoCertificado",
+                    "StatusProcessamento": "REJEICAO",
+                    "LoteDFe": [], "Alertas": [], "Erros": [],
+                    "TipoAmbiente": "PRODUCAO", "VersaoAplicativo": "1.0.0.0",
+                })
+            if cnpj_consulta[:8] != cnpj_cert[:8]:
+                return self._json(400, {
+                    "TipoConsulta": "CnpjBase",
+                    "StatusProcessamento": "REJEICAO",
+                    "LoteDFe": [], "Alertas": [],
+                    "Erros": [{"Codigo": "E0001",
+                               "Descricao": "CNPJ da consulta nao corresponde ao certificado."}],
+                    "TipoAmbiente": "PRODUCAO", "VersaoAplicativo": "1.0.0.0",
+                })
+
             meus = self._meus_docs()
             lote = [d for d in meus if d["NSU"] > nsu][:50]
             max_nsu = max((d["NSU"] for d in meus), default=0)
             if not lote:
                 return self._json(200, {
+                    "TipoConsulta": "CnpjBase",
                     "StatusProcessamento": "NENHUM_DOCUMENTO_LOCALIZADO",
                     "LoteDFe": [], "ultNSU": nsu, "maxNSU": max_nsu,
                 })
             return self._json(200, {
+                "TipoConsulta": "CnpjBase",
                 "StatusProcessamento": "DOCUMENTOS_LOCALIZADOS",
                 "LoteDFe": lote,
                 "ultNSU": lote[-1]["NSU"],
                 "maxNSU": max_nsu,
             })
-        m = re.match(r"^/NFSe/([0-9A-Za-z]+)/Eventos$", self.path)
+        m = re.match(r"^/NFSe/([0-9A-Za-z]+)/Eventos$", caminho.path)
         if m:
             ch = m.group(1)
             evts = [d for d in self._meus_docs()
@@ -203,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             if not evts:
                 return self._json(404, {"mensagem": "Nenhum evento"})
             return self._json(200, {"LoteDFe": evts})
-        m = re.match(r"^/danfse/([0-9A-Za-z]+)$", self.path)
+        m = re.match(r"^/danfse/([0-9A-Za-z]+)$", caminho.path)
         if m:
             pdf = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
                    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
